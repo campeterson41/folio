@@ -42,6 +42,8 @@ def main():
     ap.add_argument('--input', type=Path, required=True)
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--native-stem', type=Path)
+    ap.add_argument('--adaptive',action='store_true',help='Experimental recording-aware register protection and final leveling')
+    ap.add_argument('--conservative-stem',type=Path,help='Reuse a verified conservative restoration in adaptive mode')
     ap.add_argument('--device', choices=['cuda','cpu'], default='cuda')
     ap.add_argument('--preserve-voiced-fricatives', action='store_true',
                     help='Experimental stronger-loss detector for voiced Z-like sounds')
@@ -51,6 +53,7 @@ def main():
                     help='Optional final 160 Hz bass shelf in dB; try 0.5 for a subtle lift')
     ap.add_argument('--preset', type=Path, default=ROOT/'presets/f-voice-tone-20261021.json')
     args = ap.parse_args()
+    if args.conservative_stem and not args.adaptive:ap.error('--conservative-stem requires --adaptive')
     if not math.isfinite(args.bass_db) or not -3 <= args.bass_db <= 3:
         ap.error('--bass-db must be between -3 and +3 dB')
     if args.output.suffix.lower() != '.wav':
@@ -73,6 +76,10 @@ def process(args):
     source_hash = sha(args.input)
     preset = json.loads(args.preset.read_text())
     artifacts = None
+    adaptive = None
+    if getattr(args,'adaptive',False) and not getattr(args,'conservative_stem',None):
+        from voicelab.conservative import binary
+        binary(runtime_root())
     with tempfile.TemporaryDirectory(prefix='voice-lab-f-',dir=args.output.parent) as tmp:
         stem = args.native_stem or Path(tmp)/'native.wav'
         if args.native_stem is None:
@@ -87,6 +94,17 @@ def process(args):
         final = Path(tmp)/'final.wav'
         guard = preserve_file(args.input,baseline,final,
                               voiced_fricatives=args.preserve_voiced_fricatives)
+        if getattr(args,'adaptive',False):
+            from voicelab.conservative import restore,validate
+            from voicelab.adaptive import protect
+            gentle=getattr(args,'conservative_stem',None) or Path(tmp)/'conservative.wav'
+            if not getattr(args,'conservative_stem',None):
+                restore(args.input,gentle,runtime_root())
+            conservative_receipt=validate(gentle,source_hash,info.frames)
+            adaptive_target=Path(tmp)/'adaptive.wav'
+            adaptive=protect(args.input,final,gentle,adaptive_target)
+            adaptive['conservative_restoration']=conservative_receipt
+            final=adaptive_target
         bass = None
         if getattr(args,'bass_db',0):
             from voicelab.finish_tone import bass_file
@@ -94,7 +112,7 @@ def process(args):
             bass = bass_file(final,bass_target,args.bass_db)
             final = bass_target
         finishing = None
-        if getattr(args,'finish_levels',False):
+        if getattr(args,'finish_levels',False) or adaptive is not None:
             from voicelab.finish_levels import finish_file
             finished = Path(tmp)/'finished.wav'
             settings = preset['mastering_settings']
@@ -106,15 +124,17 @@ def process(args):
         if sha(args.input) != source_hash:
             raise RuntimeError('Source changed during processing')
         metadata = {
-            'recipe':('f-auto-consonants-v2' if args.preserve_voiced_fricatives else 'f-auto-consonants-v1') + ('-bass' if bass else '') + ('-levels' if finishing else ''), 'source_sha256':source_hash,
+            'recipe':('folio-adaptive-v1' if adaptive is not None else ('f-auto-consonants-v2' if args.preserve_voiced_fricatives else 'f-auto-consonants-v1')) + ('-bass' if bass else '') + ('-levels' if finishing else ''), 'source_sha256':source_hash,
             'output_sha256':sha(final), 'samples':info.frames,
             'preset_sha256':sha(args.preset), 'native_restoration':native_receipt,
             'mastering':mastering, 'automatic_consonant_preservation':guard,
             'level_finishing':finishing, 'bass_adjustment':bass, 'fresh_runtime_verification':artifacts,
+            'adaptive_control':adaptive,
             'implementation_sha256':{str(p.relative_to(ROOT)):sha(p) for p in [
                 Path(__file__).resolve(),ROOT/'src/voicelab/f_master_file.py',
                 ROOT/'src/voicelab/consonant_file.py',ROOT/'src/voicelab/consonant_plan.py',
-                ROOT/'src/voicelab/finish_levels.py',ROOT/'src/voicelab/finish_tone.py']},
+                ROOT/'src/voicelab/finish_levels.py',ROOT/'src/voicelab/finish_tone.py',
+                ROOT/'src/voicelab/adaptive.py',ROOT/'src/voicelab/conservative.py']},
             'status':'Experimental general processor; human evaluation pending. '
                      'Audio buffers bounded; global 10ms decision arrays scale with duration.',
         }

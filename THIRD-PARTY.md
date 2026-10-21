@@ -8,6 +8,7 @@ artifacts and verifies their SHA-256 hashes before inference.
 | --- | --- | --- |
 | TF-Restormer implementation | [dmlguq456/TF_Restormer](https://github.com/dmlguq456/TF_Restormer), commit `eaefe1cb3811c13f324eee34a81564cff8b7da7e` | MIT; upstream notice retained at [licenses/TF_Restormer.txt](licenses/TF_Restormer.txt) |
 | Selected checkpoint | [shinuh/tf-restormer-baseline](https://huggingface.co/shinuh/tf-restormer-baseline), revision `bd8ffc3105299ea5497797783ed1ce750e089523`, corrected epoch 19 export | Upstream model card declares MIT |
+| Optional DeepFilterNet denoiser | [Rikorose/DeepFilterNet](https://github.com/Rikorose/DeepFilterNet), pinned v0.5.6 Linux executable; SHA-256 in `resources/conservative-lock.json` | Upstream MIT notice retained at [licenses/DeepFilterNet.txt](licenses/DeepFilterNet.txt); binary downloaded separately |
 
 PyTorch, NumPy, SciPy, SoundFile, uv, Python and other dependencies retain their
 own licenses. NVIDIA runtime wheels have separate NVIDIA terms. Folio's MIT

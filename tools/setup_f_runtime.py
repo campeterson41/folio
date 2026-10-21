@@ -150,6 +150,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--verify-only',action='store_true')
     ap.add_argument('--offline',action='store_true',help='Use cached packages/code/weights only')
+    ap.add_argument('--with-conservative',action='store_true',help='Install the optional adaptive-mode denoiser')
     args=ap.parse_args()
     if platform.system()!='Linux' or platform.machine()!='x86_64':
         raise SystemExit('This frozen runtime targets Linux x86_64')
@@ -185,6 +186,10 @@ def perform(runtime,args):
         if args.offline:command.append('--offline')
         run(*command,env=dict(os.environ,UV_HTTP_TIMEOUT='240'))
     result=verify_install(runtime)
+    if getattr(args,'with_conservative',False):
+        from voicelab.conservative import binary,install
+        path=binary(runtime) if args.verify_only else install(runtime,args.offline)
+        result['conservative_binary_sha256']=sha(path)
     if not args.verify_only:
         result['managed_by']=OWNER
         launcher=ROOT/'bin/voice-lab-f'

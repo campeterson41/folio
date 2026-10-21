@@ -4,7 +4,9 @@ Experimental, local voice restoration for audiobook narration.
 
 Folio combines the open-source **TF-Restormer** model with EQ, level control and
 automatic preservation of consonants that restoration may suppress. Audio stays
-on your computer. No subscription, API key or paid service is required.
+on your computer by default. No subscription, API key or paid service is required
+for restoration. An optional, explicitly invoked Gemini reviewer can receive
+short excerpts, as described below.
 
 This is an early **Python command-line processor**, separate from a recording
 or editing application. It is not an Auphonic implementation or affiliated with
@@ -56,6 +58,64 @@ The base detector is conservative. `--preserve-voiced-fricatives` enables the
 experimental Automatic 2 detector, including quieter voiced fricatives. The
 supplied tone preset was tuned for one speaker and microphone; it is not
 personalized automatically for every voice.
+
+## Experimental adaptive mode
+
+Adaptive mode analyzes 40 ms windows every 20 ms, estimates the recording's usual
+vocal register and chooses a gentler, source-preserving denoiser for higher-register
+phrases. It learns a restrained EQ match from intact narration in this recording,
+smooths transitions, aligns the two paths and applies final level control.
+
+```sh
+python tools/setup_f_runtime.py --with-conservative
+bin/folio --input narration.wav --output adaptive.wav \
+  --preserve-voiced-fricatives --bass-db 0.5 --adaptive
+```
+
+The additional pinned DeepFilterNet executable is about 36 MB. Its model receives
+bounded windows with context. The output receipt includes routing regions, a
+half-second analysis timeline, learned EQ and gain decisions. Processing uses
+neither transcripts nor manually supplied word locations.
+
+This controller is a local heuristic, **not an AI listening verdict**. Pitch is
+a routing hint; it does not prove that speech is damaged. Adaptive mode remains
+opt-in and needs listening validation across voices and microphones. It never
+calls a cloud provider itself.
+
+## Optional Gemini listening review
+
+`bin/folio-review` prepares matching raw/current/adaptive excerpts and blinds the
+two processed versions as A and B. It matches levels with constant gain, leaving
+EQ and dynamics untouched. The default is a local preparation report: **nothing
+is sent unless you add `--send`**.
+
+```sh
+bin/folio-review --raw narration.wav --current restored.wav \
+  --adaptive adaptive.wav --receipt adaptive.json --output review-plan.json
+```
+
+The adaptive receipt selects up to three diverse 12-second excerpts: higher
+register, ordinary narration and a loud event when detected. Inspect their start times in the
+plan, or choose exact excerpts with repeated `--excerpt START:DURATION` arguments
+instead of `--receipt`. The hard limit is three excerpts of 15 seconds each,
+across three versions (135 seconds of audio total). No complete recording is sent.
+
+For an actual review, provide `GEMINI_API_KEY` through your own scoped credential
+loader or child-process environment, repeat the command with `--send` and a new
+output filename. Folio does not store the key. The default model is
+`gemini-3.5-flash-lite`, with a single request and at most 1,800 output tokens.
+Upload attempts are recorded before the network call, including failed/rejected
+results; there are no automatic retries. See Google's current
+[pricing](https://ai.google.dev/gemini-api/docs/pricing) and
+[data terms](https://ai.google.dev/gemini-api/terms) for your account tier.
+
+The review contains observations and restrained EQ/restoration suggestions.
+Suggestions are validated (EQ within ±1 dB) and **never applied automatically**.
+The receipt's `advice_applies_to` explicitly names which processed version was B.
+It cannot issue processing commands or patch words. Model judgments can miss
+small artifacts or be wrong; this is an experimental second opinion, not a
+substitute for listening. Network request handling is covered by synthetic tests;
+live provider access requires your own valid key.
 
 ## Current limits
 
