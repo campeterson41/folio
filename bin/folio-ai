@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+folio_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+folio_runtime="${VOICE_LAB_RUNTIME:-$HOME/.local/share/folio}"
+export PYTHONPATH="$folio_root/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$folio_runtime/f-venv/bin/python" "$folio_root/tools/apply_voice_plan.py" "$@"

@@ -82,6 +82,10 @@ a routing hint; it does not prove that speech is damaged. Adaptive mode remains
 opt-in and needs listening validation across voices and microphones. It never
 calls a cloud provider itself.
 
+Listening feedback found abrupt/choppy changes in this first adaptive mode.
+It remains experimental; a passing waveform or playback test does not establish
+transparent restoration transitions.
+
 ## Optional Gemini listening review
 
 `bin/folio-review` prepares matching raw/current/adaptive excerpts and blinds the
@@ -116,6 +120,32 @@ It cannot issue processing commands or patch words. Model judgments can miss
 small artifacts or be wrong; this is an experimental second opinion, not a
 substitute for listening. Network request handling is covered by synthetic tests;
 live provider access requires your own valid key.
+
+## Experimental Gemini-directed rendering
+
+An actual completed audio review can drive a separate local render:
+
+```sh
+bin/folio-ai --input narration.wav --base restored.wav \
+  --gentle-stem conservative.wav --review review.json --output ai-guided.wav
+```
+
+This currently requires a verified DeepFilterNet conservative stem/receipt and
+a review whose blinded **B** candidate is the exact supplied Folio base. It
+rejects missing, failed, unrelated or wholly uncertain review advice. The base
+must be PCM-16/24 so samples outside protected regions remain exact.
+
+If Gemini recommends gentler restoration on higher-register examples, the
+renderer infers complete speech regions from the original recording. It uses
+the gentler path throughout each selected region, with transitions padded into
+pauses, a robust fixed path-matching gain, and restrained EQ advice. It does not
+convert the review excerpts into timestamp-specific patches. A near-mic overload
+keeps its complete utterance on the existing peak-safe path.
+
+Gemini supplies advice; local models and DSP produce the audio. It does not
+generate a new performance or recover Auphonic's proprietary model. Automated
+listening opinions can be vague or wrong. This mode is experimental and needs
+human audition, especially across character voices and changing microphone distance.
 
 ## Current limits
 

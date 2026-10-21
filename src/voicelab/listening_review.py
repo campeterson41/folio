@@ -191,6 +191,8 @@ def review(paths, windows, model=MODEL, send=False, opener=None, recorder=None):
     body = {'contents': [{'role': 'user', 'parts': parts}],
             'generationConfig': {'temperature': 0, 'maxOutputTokens': MAX_OUTPUT_TOKENS,
                                  'responseMimeType': 'application/json'}}
+    if model == 'gemini-3.8-flash':
+        body['generationConfig']['thinkingConfig'] = {'thinkingLevel': 'low'}
     request = urllib.request.Request(
         f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
         data=json.dumps(body).encode(), method='POST',
