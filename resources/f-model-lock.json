@@ -1,0 +1,31 @@
+{
+  "family": "tf-restormer",
+  "source": {
+    "origin": "https://github.com/dmlguq456/TF_Restormer.git",
+    "revision": "eaefe1cb3811c13f324eee34a81564cff8b7da7e",
+    "directory": "vendor/TF_Restormer"
+  },
+  "model_repo": "shinuh/tf-restormer-baseline",
+  "model_revision": "bd8ffc3105299ea5497797783ed1ce750e089523",
+  "source_epoch": 19,
+  "artifacts": {
+    "config.yaml": {
+      "path": "models/tf-restormer/config.yaml",
+      "sha256": "d94e7509dfa84a09d76a81a71a4861fc8cf3684b753d45eb24b7ff5ef27daf8e"
+    },
+    "model.pt": {
+      "path": "models/tf-restormer/model.pt",
+      "sha256": "d67115273bed06cb1ab06de57168e6ce6e56dfcf3c626b3e3fbc6eb945b5424e"
+    },
+    "export_metadata.json": {
+      "path": "models/tf-restormer/export_metadata.json",
+      "sha256": "9bfc955e0361ce53a0150291b56032b46015e619386854aa9b9507043f5e4ae1"
+    }
+  },
+  "license_evidence": {
+    "source": "MIT; upstream LICENSE copied into licenses/TF_Restormer.txt",
+    "model_card": "https://huggingface.co/shinuh/tf-restormer-baseline",
+    "model_card_license": "mit",
+    "verified_date": "2026-10-21"
+  }
+}

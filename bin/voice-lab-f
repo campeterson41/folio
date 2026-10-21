@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+VOICE_LAB_F_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+VOICE_LAB_F_RUNTIME="${VOICE_LAB_RUNTIME:-$HOME/.local/share/folio}"
+if [[ -f "$VOICE_LAB_F_RUNTIME/f-venv/.voice-lab-f-verified.json" ]]; then
+  VOICE_LAB_F_PYTHON="$VOICE_LAB_F_RUNTIME/f-venv/bin/python"
+else
+  VOICE_LAB_F_PYTHON="$VOICE_LAB_F_RUNTIME/round2-venv/bin/python"
+fi
+if [[ ! -x "$VOICE_LAB_F_PYTHON" ]]; then
+  printf '%s\n' "Install the F runtime with: python $VOICE_LAB_F_ROOT/tools/setup_f_runtime.py" >&2
+  exit 1
+fi
+export PYTHONPATH="$VOICE_LAB_F_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$VOICE_LAB_F_PYTHON" "$VOICE_LAB_F_ROOT/tools/enhance_f.py" "$@"

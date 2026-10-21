@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+FOLIO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$FOLIO_ROOT/bin/voice-lab-f" "$@"
