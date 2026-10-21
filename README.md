@@ -1,18 +1,119 @@
 # Folio
 
-Experimental, local voice restoration for audiobook narration.
+Experimental, local narration cleanup for audiobook recordings.
 
-Folio combines the open-source **TF-Restormer** model with EQ, level control and
-automatic preservation of consonants that restoration may suppress. Audio stays
-on your computer by default. No subscription, API key or paid service is required
-for restoration. An optional, explicitly invoked Gemini reviewer can receive
-short excerpts, as described below.
+The recommended path is **`folio-source`**: a CPU-only processor that works on
+your recording itself. It uses no neural model, no resynthesis, no reference
+recording, no transcript and no network. It needs only NumPy, SciPy and
+SoundFile. Older neural and Gemini-assisted modes remain available below as
+optional experiments.
 
-This is an early **Python command-line processor**, separate from a recording
-or editing application. It is not an Auphonic implementation or affiliated with
-Auphonic. Comparable sound quality has not been established.
+Folio is a Python command-line processor, separate from a recording or editing
+application. It is not an Auphonic implementation or affiliated with Auphonic,
+and comparable sound quality has not been established.
 
-## Quick start
+## Quick start: source pipeline (CPU)
+
+Python 3.11 is tested. From a clone:
+
+```sh
+git clone https://github.com/campeterson41/folio.git
+cd folio
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements-source.txt
+bin/folio-source --input narration.wav --output cleaned.wav
+```
+
+`bin/folio-source` uses `FOLIO_PYTHON` if set, otherwise `.venv/bin/python`
+when present, otherwise `python3`.
+
+- Input must be a **48 kHz mono WAV**. Convert other formats first; Folio does
+  not resample or mix down for this path.
+- The take needs **quiet room tone**: several unbroken pauses of at least 0.3 s
+  that contain only background noise. Noise is learned from the quietest quarter
+  of the recording. Very short takes, or continuous noise/music with no pauses,
+  are refused with an explanation rather than processed blindly.
+- Output is a 24-bit PCM file in the RF64 (64-bit WAV) container, with exactly
+  the input's sample count, plus a JSON receipt beside it (`cleaned.json`).
+  Most editors and FFmpeg read RF64; for a tool that needs a classic WAV header,
+  `ffmpeg -i cleaned.wav -c:a pcm_s24le cleaned-classic.wav` converts it
+  losslessly. Existing files are never overwritten, the
+  input is hash-checked before and after, and nothing is published if processing
+  fails or is interrupted.
+
+On a 12-thread development laptop, a five-minute synthetic take took about 80
+seconds; time grows roughly in proportion to length.
+
+### What the source pipeline does
+
+All stages apply gains or fixed filters to the original performance; nothing is
+generated, replaced, re-timed or edited.
+
+1. **Noise estimate.** Median spectrum of up to 256 quiet, non-pitched moments.
+2. **Analysis branch.** A gentle (≤12 dB) spectral noise reduction, 50 Hz
+   high-pass, the preset's broad tone curve, its fixed gain and a −4 dBFS peak
+   limiter. This branch is only measured to steer level control.
+3. **Quieter branch.** The same chain from the raw input with stronger noise
+   subtraction (1.6×, ≤18 dB). Gains are positive and real, so the source
+   phase in each STFT bin is kept.
+4. **Level control.** Gentle 1.5:1 compression of loud speech (at most 2.5 dB) and up
+   to 9 dB of soft reduction in pauses, with a guard so detected syllables and
+   consonants are not reduced.
+5. **Closer, warmer finish.** Up to 6 dB of attenuation where spectral energy is
+   falling after louder sound (a late room-tail heuristic), then a 3 dB low shelf
+   centred at 160 Hz.
+
+Processing streams aligned 30-second blocks with 2 seconds of context, so long
+chapters use bounded audio memory. With the pinned library versions, the same
+input and settings reproduce the same output file.
+
+### Settings
+
+```sh
+bin/folio-source --input narration.wav --output cleaned.wav --tail-db 3 --bass-db 1.5
+```
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `--tail-db` | 6 (0–6) | Less lingering room sound. Higher values can also soften quiet word endings and breaths; 0 disables it. |
+| `--bass-db` | 3 (0–4) | Warmth below roughly 160 Hz. Lower it for boomy rooms or proximity effect. |
+| `--preset` | `presets/source-narration-v1.json` | Broad tone curve (±6 dB) and fixed gain. |
+
+The supplied preset was **developed for one speaker and one microphone**,
+and the defaults were preferred on one real recording. That is a single
+listening approval, not a benchmark. Other voices, rooms and microphones may
+need a different tone curve, gain, tail or bass setting. To adjust the tone,
+copy the preset and edit `tone.gains_db` (dB at the listed `frequencies_hz`)
+or `gain_db`; there is no automatic loudness normalization in this path.
+
+### Limits of the source pipeline
+
+- The room-tail reduction is a **fixed heuristic**: it compares each band with a
+  delayed, decaying average of its own recent power. It does not estimate the
+  room's impulse response or separate reverberation exactly, and it can reduce
+  quiet speech that follows louder sound. It is loosely motivated by spectral
+  subtraction for late reverberation ([Lebart, Boucher & Denbigh,
+  2001](https://www.ee.columbia.edu/~dpwe/papers/LebBD01-ssdereverv.pdf)) but
+  does not implement that paper's estimator.
+- Noise reduction assumes steady background noise learned once per take. It can
+  leave a mild "watery" texture on hiss-heavy takes and does not remove sudden
+  noises, mouth clicks or noise that changes during the recording.
+- Very loud passages are held near −4 dBFS by a peak limiter before the bass
+  shelf; the receipt warns when it reduces peaks by more than 6 dB. Output whose
+  estimated true peak would reach −0.1 dBFS is refused rather than clipped.
+  Clipping already in the recording cannot be repaired.
+- No retake removal, speech editing or chapter splitting is performed.
+- Passing tests are synthetic-signal checks, not listening proof. Keep the
+  original and audition the result before using it in a book.
+
+## Optional: neural restoration (TF-Restormer, GPU)
+
+The earlier, heavier path combines the open-source **TF-Restormer** model with
+EQ, level control and automatic preservation of consonants that restoration
+may suppress. Audio stays on your computer by default. An optional, explicitly
+invoked Gemini reviewer can receive short excerpts, as described below.
+
+### Setup
 
 The tested installer supports **Linux x86_64** and Python 3.11.17. A compatible
 NVIDIA driver is recommended: the pinned inference wheels use CUDA 12.1.
@@ -46,7 +147,7 @@ level control is disabled. The commands above enable it; it does not cut that
 section from the recording.
 `--device cpu` is available; chapter-length CPU performance has not been validated.
 
-## What happens to the sound?
+### What happens to the sound?
 
 1. The pinned TF-Restormer checkpoint processes overlapping windows with context.
 2. A saved numerical EQ/dynamics preset and subtle presence adjustment are applied.
@@ -59,7 +160,7 @@ experimental Automatic 2 detector, including quieter voiced fricatives. The
 supplied tone preset was tuned for one speaker and microphone; it is not
 personalized automatically for every voice.
 
-## Experimental adaptive mode
+### Experimental adaptive mode
 
 Adaptive mode analyzes 40 ms windows every 20 ms, estimates the recording's usual
 vocal register and chooses a gentler, source-preserving denoiser for higher-register
@@ -86,7 +187,7 @@ Listening feedback found abrupt/choppy changes in this first adaptive mode.
 It remains experimental; a passing waveform or playback test does not establish
 transparent restoration transitions.
 
-## Optional Gemini listening review
+### Optional Gemini listening review
 
 `bin/folio-review` prepares matching raw/current/adaptive excerpts and blinds the
 two processed versions as A and B. It matches levels with constant gain, leaving
@@ -121,7 +222,7 @@ small artifacts or be wrong; this is an experimental second opinion, not a
 substitute for listening. Network request handling is covered by synthetic tests;
 live provider access requires your own valid key.
 
-## Experimental Gemini-directed rendering
+### Experimental Gemini-directed rendering
 
 An actual completed audio review can drive a separate local render:
 
@@ -158,7 +259,7 @@ generate a new performance or recover Auphonic's proprietary model. Automated
 listening opinions can be vague or wrong. This mode is experimental and needs
 human audition, especially across character voices and changing microphone distance.
 
-## Current limits
+### Limits of the neural path
 
 - Neural restoration can alter consonants or vocal texture. Preservation remains
   experimental and does not guarantee faithful pronunciation.
@@ -174,7 +275,7 @@ human audition, especially across character voices and changing microphone dista
 
 Keep an original, and audition the result before using it in a book.
 
-## Reproducibility
+### Neural runtime reproducibility
 
 ```sh
 python tools/setup_f_runtime.py --verify-only
@@ -189,7 +290,8 @@ Setup `--offline` uses existing caches and fails if an artifact is missing.
 ## Tests
 
 The tests generate synthetic signals; no personal recordings or model weights
-are included in this repository. Most tests run without a GPU or model download.
+are included in this repository. Most tests run without a GPU or model download;
+the source-pipeline tests need only `requirements-test.txt`.
 
 ```sh
 python -m venv .venv-test
@@ -199,8 +301,8 @@ python -m venv .venv-test
 
 ## License and credits
 
-Folio's original code is MIT-licensed. TF-Restormer and the selected public
-checkpoint are independently published upstream; their credits and pinned
+Folio's original code is MIT-licensed. The source pipeline uses only NumPy,
+SciPy and SoundFile. TF-Restormer and the selected public checkpoint are independently published upstream; their credits and pinned
 sources are in [THIRD-PARTY.md](THIRD-PARTY.md).
 
 Contributions and reports of general failure cases are welcome. Please don't

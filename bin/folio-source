@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+folio_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+folio_python="${FOLIO_PYTHON:-}"
+if [[ -z "$folio_python" ]]; then
+  if [[ -x "$folio_root/.venv/bin/python" ]]; then
+    folio_python="$folio_root/.venv/bin/python"
+  else
+    folio_python="python3"
+  fi
+fi
+exec "$folio_python" "$folio_root/tools/folio_source.py" "$@"
