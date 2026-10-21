@@ -15,7 +15,7 @@ def fixture(tmp_path, shift=0):
     phase = np.cumsum(2*np.pi*f/48000)
     x = .04*(np.sin(phase)+.3*np.sin(phase*2))*active
     src, base, gentle = [tmp_path/(n+'.wav') for n in ['raw','base','gentle']]
-    y = x*.5; y[high] *= .15
+    y = x*.5; y[high] *= .7
     for p, z in [(src,x),(base,y),(gentle,x)]:
         sf.write(p,z,48000,subtype='PCM_24')
     receipt = dict(status='reviewed',model='gemini-test', source_sha256=[_hash(src),'comparison',_hash(base)],
@@ -50,7 +50,7 @@ def test_applied_policy_preserves_regular_voice_and_repairs_bounded_character(tm
     assert len(y)==len(old)
     np.testing.assert_array_equal(y[:48000*3],old[:48000*3])
     np.testing.assert_array_equal(y[48000*7:],old[48000*7:])
-    assert np.sqrt(np.mean(y[48000*4:48000*5]**2))>np.sqrt(np.mean(old[48000*4:48000*5]**2))*3
+    assert np.sqrt(np.mean(y[48000*4:48000*5]**2))>np.sqrt(np.mean(old[48000*4:48000*5]**2))*1.05
     assert meta['plan']['normal_narration']=='keep'
     assert meta['plan']['presence_db']==.1
     assert inputs==[p.read_bytes() for p in (src,base,gentle,report)]

@@ -137,10 +137,21 @@ must be PCM-16/24 so samples outside protected regions remain exact.
 
 If Gemini recommends gentler restoration on higher-register examples, the
 renderer infers complete speech regions from the original recording. It uses
-the gentler path throughout each selected region, with transitions padded into
+one fixed blend of the gentler path throughout each selected region, with transitions padded into
 pauses, a robust fixed path-matching gain, and restrained EQ advice. It does not
 convert the review excerpts into timestamp-specific patches. A near-mic overload
 keeps its complete utterance on the existing peak-safe path.
+
+The first full-replacement experiment introduced dropouts from gaps in the
+restoration stem. The renderer now measures each proposed blend against the
+supplied base before export: 20 ms full-band and 300–3000 Hz energy windows,
+sampled every 5 ms, must stay within a 1 dB loss and 3 dB boost wherever the base
+exceeds the recording-derived audible floor. The check includes crossfade phase
+cancellation. An unsafe proposal reduces the blend for the entire utterance or
+keeps the base unchanged; it never switches paths on each failing frame.
+The receipt records proposed and applied changes and the selected blend.
+These measured limits protect continuity relative to the base; they do not prove
+better EQ, faithful consonants or perceptual quality.
 
 Gemini supplies advice; local models and DSP produce the audio. It does not
 generate a new performance or recover Auphonic's proprietary model. Automated

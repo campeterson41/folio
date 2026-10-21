@@ -14,6 +14,7 @@ from .consonant_plan import source_profile
 from .listening_review import _hash, validate
 from .streaming import stage
 from . import dsp
+from .continuity import choose_mix, fade
 
 
 def utterances(features):
@@ -143,6 +144,10 @@ def apply(source, base, gentle, review_receipt, target, chunk_seconds=30):
                 if abs(lag) < 240:
                     lags.append(lag)
         delay = int(round(np.median(lags))) if lags else 0
+        audible_floor = max(float(np.percentile(wet_features['level_dbfs'],15))+12,
+                            float(np.percentile(wet_features['level_dbfs'],90))-40, -80.)
+        continuity = choose_mix(base,tone,regions,gain_db,delay,audible_floor_dbfs=audible_floor,
+                                chunk_seconds=chunk_seconds)
         scratch = Path(tmp) / 'result.wav'
         fmt = 'RF64' if infos[0].frames * 3 > 3900000000 else 'WAV'
         with sf.SoundFile(tone) as dry, sf.SoundFile(base) as wet, sf.SoundFile(scratch, 'x',
@@ -151,16 +156,14 @@ def apply(source, base, gentle, review_receipt, target, chunk_seconds=30):
                 n = min(round(chunk_seconds * 48000), infos[0].frames - start)
                 x = _read(dry, start - delay, n) * 10 ** (gain_db / 20)
                 wet.seek(start); y = wet.read(n, dtype='float64')
-                for a, b in regions:
+                for (a,b),checked in zip(regions,continuity['regions']):
+                    if checked['mix']==0:
+                        continue
                     lo, hi = max(a, start), min(b, start + n)
                     if lo >= hi:
                         continue
                     pos = np.arange(lo, hi)
-                    # 120ms fades fit inside the 140ms pause padding.
-                    fade = min(5760, (b - a) // 2)
-                    w = np.minimum(np.clip((pos - a) / max(1, fade), 0, 1),
-                                   np.clip((b - 1 - pos) / max(1, fade), 0, 1))
-                    w = .5 - .5 * np.cos(np.pi * w)
+                    w = fade(pos,a,b)*checked['mix']
                     s = slice(lo - start, hi - start)
                     y[s] += w * (x[s] - y[s])
                 if not np.isfinite(y).all() or np.max(abs(y), initial=0) >= 1:
@@ -170,7 +173,7 @@ def apply(source, base, gentle, review_receipt, target, chunk_seconds=30):
             raise ValueError('An input changed during rendering')
         if sf.info(scratch).frames != infos[0].frames:
             raise ValueError('Output duration changed')
-        metadata = {'recipe': 'folio-gemini-phrases-v1',
+        metadata = {'recipe': 'folio-gemini-phrases-v2-guarded',
                     'source_sha256': hashes[0], 'base_sha256': hashes[1], 'gentle_sha256': hashes[2],
                     'review_sha256': hashes[3], 'output_sha256': _hash(scratch),
                     'samples': infos[0].frames, 'plan': plan,
@@ -179,7 +182,9 @@ def apply(source, base, gentle, review_receipt, target, chunk_seconds=30):
                     'baseline_pitch_hz': decision['baseline_pitch_hz'],
                     'pause_padding_ms': 140, 'fade_ms': 120, 'alignment_samples': delay,
                     'gentle_matching_gain_db': gain_db, 'gentle_eq_profile': profile,
+                    'continuity_control': continuity,
                     'implementation_sha256': _hash(Path(__file__)),
+                    'continuity_implementation_sha256': _hash(Path(__file__).with_name('continuity.py')),
                     'status': 'Experimental Gemini-directed local rendering. No claim of Auphonic equivalence or human approval.'}
         # Exclusive publication, preserving all original files.
         with scratch.open('rb') as inp, target.open('xb') as out:
