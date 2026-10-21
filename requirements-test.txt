@@ -1,4 +1,2 @@
-numpy==1.26.4
-scipy==1.17.1
-soundfile==0.14.0
+-r requirements-source.txt
 pytest==9.1.1
