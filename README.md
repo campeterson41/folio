@@ -22,7 +22,7 @@ It does not access recordings or accounts.
 git clone https://github.com/campeterson41/folio.git
 cd folio
 python tools/setup_f_runtime.py
-bin/folio --input narration.wav --output restored.wav --preserve-voiced-fricatives
+bin/folio --input narration.wav --output restored.wav --preserve-voiced-fricatives --finish-levels
 ```
 
 Input currently must be **48 kHz mono WAV**. Output is PCM-24 WAV, with the same
@@ -33,12 +33,15 @@ For a small bass lift:
 
 ```sh
 bin/folio --input narration.wav --output warmer.wav \
-  --preserve-voiced-fricatives --bass-db 0.5
+  --preserve-voiced-fricatives --bass-db 0.5 --finish-levels
 ```
 
 `--bass-db 0.5` adds a gentle 160 Hz low shelf. The default is no extra bass.
 `--finish-levels` adds optional final RMS/peak control. Its -20 dBFS RMS target
 can remain unmet when the -4 dBFS peak ceiling takes precedence.
+A loud near-microphone test section can hold the rest of a take down when final
+level control is disabled. The commands above enable it; it does not cut that
+section from the recording.
 `--device cpu` is available; chapter-length CPU performance has not been validated.
 
 ## What happens to the sound?
@@ -58,6 +61,8 @@ personalized automatically for every voice.
 
 - Neural restoration can alter consonants or vocal texture. Preservation remains
   experimental and does not guarantee faithful pronunciation.
+- Early listening tests found muddling on acted and higher-register voices in the
+  current checkpoint. EQ alone cannot guarantee a repair; alternatives remain under evaluation.
 - Short bursts of high-frequency interference may be mistaken for lost speech and
   restored from the source. Steady-noise tests do not cover this failure mode.
 - There is no recording UI, waveform editor, automatic chapter splitting or audiobook
