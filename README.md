@@ -1,16 +1,100 @@
 # Folio
 
-Experimental, local narration cleanup for audiobook recordings.
+Local narration restoration with a close, full vocal sound.
 
-The recommended path is **`folio-source`**: a CPU-only processor that works on
-your recording itself. It uses no neural model, no resynthesis, no reference
-recording, no transcript and no network. It needs only NumPy, SciPy and
-SoundFile. Older neural and Gemini-assisted modes remain available below as
-optional experiments.
+**Folio Studio v0.3 is the official version.** `bin/folio` now runs the saved
+22% blend recipe: source-based cleanup and bass, room prediction, denoising,
+parallel vocal compression, a restored voice blend, and a very quiet continuous
+synthetic floor. The preset comes from a listening-approved recording. It was
+tuned on one speaker and microphone; other recordings may need adjustment.
 
-Folio is a Python command-line processor, separate from a recording or editing
-application. It is not an Auphonic implementation or affiliated with Auphonic,
-and comparable sound quality has not been established.
+Folio is a standalone Python command-line processor. Processing stays local and
+needs no accounts, API keys or reference recording. Setup downloads public model
+weights and dependencies. Folio is not affiliated with Auphonic, and this single
+listening approval does not establish comparable results across recordings.
+
+## Quick start: official Studio version
+
+The frozen installer supports **Linux x86_64**, Python 3.11.17, and CUDA 12.1
+wheels. A compatible NVIDIA GPU/driver is recommended. Git and Python 3.11+ are
+needed to run setup; dependencies and weights take several GB.
+
+```sh
+git clone https://github.com/campeterson41/folio.git
+cd folio
+python3 tools/setup_studio_runtime.py
+bin/folio --input narration.wav --output studio.wav
+```
+
+Input must be **48 kHz mono WAV**, at least five seconds long, with several quiet
+pauses for source noise estimation. Output is a **24-bit WAV** and a JSON receipt.
+No words or retakes are removed by default: the sample count stays unchanged.
+Existing files are never overwritten. Audio is processed in bounded windows;
+coarse decision arrays and temporary disk usage grow with the take's duration.
+Allow about 1.5 GiB per input minute in temporary free disk space and substantial
+processing time; the command checks available space before starting. CPU model inference is available with `--device cpu`, but has not been
+benchmarked for chapter-length takes.
+
+The official preset is [`presets/studio-v1.json`](presets/studio-v1.json).
+It contains numerical EQ curves, dynamics settings and a deterministic noise
+filter. It contains no recording samples, transcripts, edit decisions or private
+repair timestamps. The final mix is 78% dense source voice and 22% restored voice.
+A separate 20% guide estimates the last cleanup pass; it does not replace the
+selected mix's phase. Cleanup can reduce up to 2 dB in protected speech and
+9 dB in pauses. A quiet shaped floor is added **after** voice cleanup, to avoid
+hard digital silence between phrases. `--fuzz 0` disables that generated floor.
+
+```sh
+# Keep the official blend, with no added floor:
+bin/folio --input narration.wav --output dry.wav --fuzz 0
+# Explicit official fractions (fractions, not percentages):
+bin/folio --input narration.wav --output official.wav --blend 0.22 --fuzz 0.3147313529485418
+# Verify installed artifacts without downloading, or install from local caches:
+python3 tools/setup_studio_runtime.py --verify-only
+python3 tools/setup_studio_runtime.py --offline
+```
+
+`VOICE_LAB_RUNTIME` changes the default `~/.local/share/folio` runtime location.
+`FOLIO_PYTHON` can select an existing compatible Python environment.
+The renderer uses TF-Restormer, nara-wpe and the pinned DeepFilterNet executable.
+It never reads an Auphonic waveform at runtime. Neural processing may alter fine
+speech detail, and the denoiser has a 16-bit intermediate; a 24-bit final file
+does not imply lossless restoration.
+
+### Saved sessions and reproduction
+
+`--native-stem native.wav` reuses TF inference only after checking its adjacent
+JSON receipt, source hash, recipe and output hash. `--edit-list edits.json` takes
+an optional sample-index keep list. For example, a **synthetic** ten-second take:
+
+```json
+{"sample_rate":48000,"keep":[[0,192000],[240000,480000]],"crossfade_samples":384,"edge_fade_samples":384}
+```
+
+The processor applies edits after the full-take source/early mastering stages.
+`--repair-regions repairs.json` optionally accepts a local plan such as
+`{"sample_rate":48000,"regions":[[48000,52800]]}` in source sample coordinates.
+`--preview-gain-db` can restore a saved session's pre-edit gain; otherwise it is
+estimated from percentile-based speech levels in the new recording. A robust
+activity fallback prevents a loud isolated bump from marking most speech as pauses.
+
+The approved prototype used a saved repair plan from an earlier detector whose
+implementation was subsequently changed. **New recordings use the current
+automatic detector**, so repair choices can differ from that prototype. The
+frozen tone, mix, compression and floor settings are preserved. Reproducing a
+saved take uses its local edit/repair plans and native stem; those private files
+are not distributed. Streaming arithmetic and GPU inference can also prevent
+byte-identical output. The automatic gain and detector are recording-derived
+and have not received the prototype's listening approval. Saved-session
+reproduction needs the native stem, edit/repair plans **and** the saved preview
+gain. Audition new renders against the original, especially
+consonants and louder passages. Tests verify signal behavior, not listening
+quality.
+
+## Earlier CPU-only source mode
+
+`bin/folio-source` remains available for lighter processing without neural models
+or generated noise. Its separate default preset predates the Studio recipe.
 
 ## Quick start: source pipeline (CPU)
 
@@ -125,7 +209,7 @@ It does not access recordings or accounts.
 git clone https://github.com/campeterson41/folio.git
 cd folio
 python tools/setup_f_runtime.py
-bin/folio --input narration.wav --output restored.wav --preserve-voiced-fricatives --finish-levels
+bin/voice-lab-f --input narration.wav --output restored.wav --preserve-voiced-fricatives --finish-levels
 ```
 
 Input currently must be **48 kHz mono WAV**. Output is PCM-24 WAV, with the same
@@ -135,7 +219,7 @@ are preserved.
 For a small bass lift:
 
 ```sh
-bin/folio --input narration.wav --output warmer.wav \
+bin/voice-lab-f --input narration.wav --output warmer.wav \
   --preserve-voiced-fricatives --bass-db 0.5 --finish-levels
 ```
 
@@ -169,7 +253,7 @@ smooths transitions, aligns the two paths and applies final level control.
 
 ```sh
 python tools/setup_f_runtime.py --with-conservative
-bin/folio --input narration.wav --output adaptive.wav \
+bin/voice-lab-f --input narration.wav --output adaptive.wav \
   --preserve-voiced-fricatives --bass-db 0.5 --adaptive
 ```
 
@@ -307,3 +391,5 @@ sources are in [THIRD-PARTY.md](THIRD-PARTY.md).
 
 Contributions and reports of general failure cases are welcome. Please don't
 post private recordings or recordings you lack permission to share in issues.
+
+Studio room prediction uses [nara-wpe 0.0.11](https://github.com/fgnt/nara_wpe) (MIT); see [its license](licenses/nara-wpe.txt).
