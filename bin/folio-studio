@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+folio_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+folio_runtime="${VOICE_LAB_RUNTIME:-$HOME/.local/share/folio}"
+folio_python="${FOLIO_PYTHON:-$folio_runtime/f-venv/bin/python}"
+if [[ ! -x "$folio_python" ]]; then
+  printf '%s\n' "Install Folio Studio: python3 $folio_root/tools/setup_studio_runtime.py" >&2
+  exit 1
+fi
+export PYTHONPATH="$folio_root/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$folio_python" "$folio_root/tools/folio_studio.py" "$@"

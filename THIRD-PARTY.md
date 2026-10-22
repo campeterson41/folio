@@ -18,7 +18,7 @@ reuses none of its code. The numerical tone/gain preset is a fixed local setting
 
 ## Neural restoration
 
-Folio's optional neural path runs the independently published TF-Restormer
+Folio Studio and the earlier neural path run the independently published TF-Restormer
 model. No model weights are redistributed in this repository; the installer downloads the pinned public
 artifacts and verifies their SHA-256 hashes before inference.
 
@@ -26,7 +26,7 @@ artifacts and verifies their SHA-256 hashes before inference.
 | --- | --- | --- |
 | TF-Restormer implementation | [dmlguq456/TF_Restormer](https://github.com/dmlguq456/TF_Restormer), commit `eaefe1cb3811c13f324eee34a81564cff8b7da7e` | MIT; upstream notice retained at [licenses/TF_Restormer.txt](licenses/TF_Restormer.txt) |
 | Selected checkpoint | [shinuh/tf-restormer-baseline](https://huggingface.co/shinuh/tf-restormer-baseline), revision `bd8ffc3105299ea5497797783ed1ce750e089523`, corrected epoch 19 export | Upstream model card declares MIT |
-| Optional DeepFilterNet denoiser | [Rikorose/DeepFilterNet](https://github.com/Rikorose/DeepFilterNet), pinned v0.5.6 Linux executable; SHA-256 in `resources/conservative-lock.json` | Upstream MIT notice retained at [licenses/DeepFilterNet.txt](licenses/DeepFilterNet.txt); binary downloaded separately |
+| DeepFilterNet denoiser | [Rikorose/DeepFilterNet](https://github.com/Rikorose/DeepFilterNet), pinned v0.5.6 Linux executable; SHA-256 in `resources/conservative-lock.json` | Upstream MIT notice retained at [licenses/DeepFilterNet.txt](licenses/DeepFilterNet.txt); binary downloaded separately |
 
 PyTorch, NumPy, SciPy, SoundFile, uv, Python and other dependencies retain their
 own licenses. NVIDIA runtime wheels have separate NVIDIA terms. Folio's MIT
@@ -36,3 +36,16 @@ an installation recipe, not a redistribution of those binaries.
 The optional low-shelf EQ uses the standard RBJ biquad equations. There are no
 Auphonic weights, service code, voice recordings, credentials or service outputs
 in the repository. The numerical preset is a fixed local EQ/dynamics setting.
+
+## Studio room prediction
+
+Studio uses [nara-wpe 0.0.11](https://github.com/fgnt/nara_wpe) (MIT),
+installed separately from PyPI. Its upstream copyright and license are retained
+at [licenses/nara-wpe.txt](licenses/nara-wpe.txt). Click is installed for the
+package import and retains its BSD-3-Clause license.
+
+The shaped floor is newly generated deterministic Gaussian noise passed through
+a saved numerical FIR filter. It contains no copied room-tone samples. The
+EQ and noise-spectrum settings were developed locally using listening feedback
+and numerical comparisons, including a processed Auphonic reference. Folio
+ships no Auphonic waveform or algorithm and needs no reference file to run.
