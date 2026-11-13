@@ -1,13 +1,23 @@
 """Room prediction, bounded cleanup and constant noise for the studio recipe."""
+from collections import deque
+from functools import partial
 from pathlib import Path
-import math,subprocess
+import math,shutil,subprocess
 import numpy as np
 import soundfile as sf
 from scipy import signal,ndimage
-from . import dsp,studio_audio as audio
+from . import dsp,parallel,studio_audio as audio
 from .streaming import windows
 
 RATE=48000
+
+
+def _stop(process):
+    if process.poll() is None:
+        process.terminate()
+        try:process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill();process.wait()
 
 
 def run_child(command):
@@ -17,12 +27,43 @@ def run_child(command):
         status=process.wait()
         if status:raise subprocess.CalledProcessError(status,command)
     except BaseException:
-        if process.poll() is None:
-            process.terminate()
-            try:process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill();process.wait()
+        _stop(process)
         raise
+
+
+def run_children(commands,limit):
+    """Run independent local processes, at most ``limit`` at once; stop all on abort."""
+    waiting=list(commands);running=[]
+    try:
+        while waiting or running:
+            while waiting and len(running)<limit:
+                command=waiting.pop(0);running.append((subprocess.Popen(command),command))
+            process,command=running[0]
+            status=process.wait()
+            running.pop(0)
+            if status:raise subprocess.CalledProcessError(status,command)
+    except BaseException:
+        for process,_ in running:_stop(process)
+        raise
+
+
+class Child:
+    """A local model process that runs beside other work."""
+    def __init__(self,command,env=None):
+        self.command=command;self.process=subprocess.Popen(command,env=env)
+    def wait(self):
+        status=self.process.wait()
+        if status:raise subprocess.CalledProcessError(status,self.command)
+
+
+class Children:
+    """Start background model processes; any still running are stopped on exit."""
+    def __init__(self):self.started=[]
+    def start(self,command,env=None):
+        child=Child(command,env);self.started.append(child);return child
+    def __enter__(self):return self
+    def __exit__(self,*exc):
+        for child in self.started:_stop(child.process)
 
 
 def room_block(x,high_focus=False):
@@ -47,66 +88,141 @@ def room_file(source,target,high_focus=False,subtype='DOUBLE',progress=lambda *a
     hop=256 if high_focus else 512
     chunk=20 if high_focus else round(20*RATE/hop)*hop/RATE
     context=1 if high_focus else round(2*RATE/hop)*hop/RATE
-    return audio.transform(source,target,lambda x:room_block(x,high_focus),
-                           context=context,chunk=chunk,subtype=subtype)
+    return audio.transform(source,target,partial(room_block,high_focus=high_focus),
+                           context=context,chunk=chunk,subtype=subtype,workers=True)
 
 
-def denoise(source,target,binary,workdir):
-    """Run the pinned streaming executable once, with real context after the take."""
+DENOISE_PREROLL=20*RATE      # model state settles on real audio before a segment starts
+DENOISE_POSTROLL=2*RATE      # look-ahead and crossfade material after it ends
+DENOISE_FADE=RATE//20        # 50 ms equal-sum crossfade at each join
+DENOISE_MINIMUM=120*RATE     # shortest segment worth a process of its own
+
+
+def denoise_plan(frames,segments):
+    """Segment edges for ``segments`` parallel runs; one run for short takes."""
+    count=max(1,min(int(segments),frames//DENOISE_MINIMUM))
+    return [round(i*frames/count) for i in range(count+1)]
+
+
+def _padded_copy(source,target,start,stop):
+    with sf.SoundFile(source) as f,audio.writer(target,stop-start+2*RATE,'FLOAT') as out:
+        out.write(np.zeros(RATE));f.seek(start);remaining=stop-start
+        while remaining:
+            x=f.read(min(audio.BLOCK,remaining));remaining-=len(x);out.write(x)
+        out.write(np.zeros(RATE))
+
+
+def denoise(source,target,binary,workdir,segments=1):
+    """Run the pinned streaming executable with real context after the take.
+
+    ``segments=1`` is the approved single pass. More segments run the same
+    executable on consecutive parts of the take at once: every part starts
+    20 s early so the model state has settled, and joins are crossfaded over
+    50 ms. That output is close to, but not identical with, the single pass.
+    """
     root=Path(workdir);root.mkdir(exist_ok=True,parents=True)
-    padded=root/'padded.wav';folder=root/'model-output';frames=sf.info(source).frames
-    with sf.SoundFile(source) as f,audio.writer(padded,frames+2*RATE,'FLOAT') as out:
-        out.write(np.zeros(RATE))
-        for x in f.blocks(audio.BLOCK):out.write(x)
-        out.write(np.zeros(RATE))
-    run_child([str(binary),'-D','-a','9','-o',str(folder),str(padded)])
-    native=folder/padded.name
-    with sf.SoundFile(native) as f,audio.writer(target,frames,'FLOAT') as out:
-        if f.samplerate!=RATE or f.channels!=1 or f.frames<RATE+frames:
-            raise ValueError('Noise model returned insufficient context')
-        native_frames=f.frames;f.seek(RATE)
-        for start in range(0,frames,audio.BLOCK):out.write(f.read(min(audio.BLOCK,frames-start)))
-    return dict(model_output_samples=native_frames,retained_samples=[RATE,RATE+frames],
-                model_output_subtype=sf.info(native).subtype)
+    folder=root/'model-output';frames=sf.info(source).frames
+    edges=denoise_plan(frames,segments);count=len(edges)-1
+    parts=[]
+    for i in range(count):
+        a=max(0,edges[i]-DENOISE_PREROLL) if i else 0
+        b=min(frames,edges[i+1]+DENOISE_POSTROLL) if i<count-1 else frames
+        path=root/('padded.wav' if count==1 else f'padded-{i}.wav')
+        _padded_copy(source,path,a,b);parts.append((path,a,b))
+    commands=[[str(binary),'-D','-a','9','-o',str(folder),str(path)] for path,_,_ in parts]
+    if count==1:run_child(commands[0])
+    else:run_children(commands,count)
+    outputs=[];native_frames=0;subtype=None
+    try:
+        for path,a,b in parts:
+            f=sf.SoundFile(folder/path.name);outputs.append(f)
+            if f.samplerate!=RATE or f.channels!=1 or f.frames<RATE+b-a:
+                raise ValueError('Noise model returned insufficient context')
+            native_frames+=f.frames;subtype=f.subtype
+        def read(i,start,stop):
+            outputs[i].seek(RATE+start-parts[i][1]);return outputs[i].read(stop-start)
+        fade=DENOISE_FADE
+        with audio.writer(target,frames,'FLOAT') as out:
+            for i in range(count):
+                start=edges[i]+fade if i else 0
+                stop=edges[i+1]-fade if i<count-1 else frames
+                for position in range(start,stop,audio.BLOCK):
+                    out.write(read(i,position,min(stop,position+audio.BLOCK)))
+                if i<count-1:
+                    ramp=(np.arange(2*fade)+.5)/(2*fade)
+                    out.write(read(i,stop,stop+2*fade)*(1-ramp)+read(i+1,stop,stop+2*fade)*ramp)
+    finally:
+        for f in outputs:f.close()
+    shutil.rmtree(root)
+    info=dict(model_output_samples=native_frames,retained_samples=[RATE,RATE+frames],
+              model_output_subtype=subtype)
+    if count>1:
+        info.update(retained_samples=None,segments=count,segment_edges=edges,
+                    preroll_seconds=DENOISE_PREROLL/RATE,crossfade_seconds=2*fade/RATE)
+    return info
+
+
+CLEANUP_FFT=2048;CLEANUP_HOP=512
+
+
+def _cleanup_block(x,r,w,offset,first,activity):
+    """One aligned cleanup window. ``activity`` holds the frames from ``first``."""
+    fft,hop=CLEANUP_FFT,CLEANUP_HOP
+    _,t,zr=signal.stft(r,RATE,nperseg=fft,noverlap=fft-hop)
+    _,_,zw=signal.stft(w,RATE,nperseg=fft,noverlap=fft-hop)
+    _,_,zx=signal.stft(x,RATE,nperseg=fft,noverlap=fft-hop)
+    db=20*np.log10(np.maximum(abs(zw),1e-12)/np.maximum(abs(zr),1e-12))
+    active=np.interp((offset/RATE+t)/.01,first+np.arange(len(activity)),activity)
+    gain=np.clip(ndimage.gaussian_filter(db,(1.5,2)),-(9-7*active)[None,:],0)
+    _,y=signal.istft(zx*10**(gain/20),RATE,nperseg=fft,noverlap=fft-hop)
+    return y[:len(x)]
 
 
 def cleanup(source,guide,model,target,speech):
     """The fixed20% guide estimates cleanup; the selected blend keeps its phase."""
     activity=ndimage.gaussian_filter1d(ndimage.maximum_filter1d(speech.astype(float),21),6,mode='nearest')
-    fft=2048;hop=512
+    hop=CLEANUP_HOP
     chunk=round(30*RATE/hop)*hop/RATE;context=round(.3*RATE/hop)*hop/RATE
     frames=sf.info(source).frames
     if any(sf.info(p).frames!=frames for p in (guide,model)):
         raise ValueError('Cleanup paths have different clocks')
     with audio.writer(target,frames,'FLOAT') as out:
-        for new,reference,wet in zip(windows(source,chunk,context),windows(guide,chunk,context),windows(model,chunk,context)):
-            start,end,x,crop=new;s,e,r,c=reference;ss,ee,w,cc=wet
-            if (start,end)!=(s,e) or (start,end)!=(ss,ee):raise ValueError('Cleanup clock mismatch')
-            _,t,zr=signal.stft(r,RATE,nperseg=fft,noverlap=fft-hop)
-            _,_,zw=signal.stft(w,RATE,nperseg=fft,noverlap=fft-hop)
-            _,_,zx=signal.stft(x,RATE,nperseg=fft,noverlap=fft-hop)
-            db=20*np.log10(np.maximum(abs(zw),1e-12)/np.maximum(abs(zr),1e-12))
-            active=np.interp(((start-crop.start)/RATE+t)/.01,np.arange(len(activity)),activity)
-            gain=np.clip(ndimage.gaussian_filter(db,(1.5,2)),-(9-7*active)[None,:],0)
-            _,y=signal.istft(zx*10**(gain/20),RATE,nperseg=fft,noverlap=fft-hop)
-            y=y[:len(x)][crop]
+        placed=deque()
+        def tasks():
+            for new,reference,wet in zip(windows(source,chunk,context),windows(guide,chunk,context),windows(model,chunk,context)):
+                start,end,x,crop=new;s,e,r,c=reference;ss,ee,w,cc=wet
+                if (start,end)!=(s,e) or (start,end)!=(ss,ee):raise ValueError('Cleanup clock mismatch')
+                offset=start-crop.start
+                # Each window interpolates activity only between its own frames; hand
+                # the worker that span on its original index, not the whole take.
+                first=max(0,offset//480-1);last=(offset+len(x))//480+8
+                placed.append((start,end,crop,len(x)))
+                yield x,r,w,offset,first,activity[first:last]
+        for y in parallel.imap(_cleanup_block,tasks()):
+            start,end,crop,length=placed.popleft()
+            y=y[crop]
             if len(y)!=end-start or not np.isfinite(y).all():raise ValueError('Invalid cleanup output')
             out.write(y)
     return Path(target)
 
 
+REGION_LOW=signal.butter(3,[300,3000],fs=RATE,btype='bandpass',output='sos')
+REGION_HIGH=signal.butter(3,[4500,14000],fs=RATE,btype='bandpass',output='sos')
+
+
+def _region_features(x,first,last):
+    c=slice(first,last)
+    return (dsp.envelope(signal.sosfiltfilt(REGION_LOW,x))[c],
+            dsp.envelope(signal.sosfiltfilt(REGION_HIGH,x))[c],
+            (ndimage.maximum_filter1d((abs(x)>=.98).astype(np.uint8),2401)[::480]>0)[c])
+
+
 def detect_regions(source,early):
     """Use the existing signal-driven consonant detector; no private word times."""
     from .consonant_plan import plan
-    low=signal.butter(3,[300,3000],fs=RATE,btype='bandpass',output='sos')
-    high=signal.butter(3,[4500,14000],fs=RATE,btype='bandpass',output='sos')
     def features(path):
-        lows=[];highs=[];clipped=[]
-        for _,_,x,crop in windows(path,30,4):
-            c=slice(crop.start//480,math.ceil(crop.stop/480))
-            lows.append(dsp.envelope(signal.sosfiltfilt(low,x))[c])
-            highs.append(dsp.envelope(signal.sosfiltfilt(high,x))[c])
-            clipped.append((ndimage.maximum_filter1d((abs(x)>=.98).astype(np.uint8),2401)[::480]>0)[c])
+        tasks=((x,crop.start//480,math.ceil(crop.stop/480)) for _,_,x,crop in windows(path,30,4))
+        lows,highs,clipped=zip(*parallel.imap(_region_features,tasks))
         return np.concatenate(lows),np.concatenate(highs),np.concatenate(clipped)
     sl,sh,clipped=features(source);wl,wh,_=features(early)
     with sf.SoundFile(source) as f:
@@ -150,7 +266,7 @@ def noise_bed(target,frames,settings,workdir):
     filtered=Path(workdir)/'noise-filtered.wav';total=frames+4096
     with audio.writer(white,total) as out:
         for start in range(0,total,audio.BLOCK):out.write(rng.standard_normal(min(audio.BLOCK,total-start)))
-    audio.transform(white,filtered,lambda x:signal.fftconvolve(x,taps,mode='same'),context=.1)
+    audio.transform(white,filtered,partial(signal.fftconvolve,in2=taps,mode='same'),context=.1,workers=True)
     energy=0.
     with sf.SoundFile(filtered) as f:
         f.seek(2048)

@@ -4,12 +4,13 @@ import numpy as np
 
 
 def restore_file(source, target, infer, core_seconds=3., context_seconds=.5,
-                 crossfade_seconds=.08, progress=lambda seconds: None):
+                 crossfade_seconds=.08, progress=lambda seconds: None, with_positions=False):
     """File-backed equivalent of restore_chunks, retaining its global grid.
 
     Keeps at most one core plus two context margins in memory. The output is
     unnormalized DOUBLE PCM; callers can measure the whole-file peak and apply
     one safety gain on export. No second layer of independently timed chunks.
+    ``with_positions=True`` also passes each core window's ``(start, end)`` samples.
     """
     import soundfile as sf
     from pathlib import Path
@@ -36,7 +37,8 @@ def restore_file(source, target, infer, core_seconds=3., context_seconds=.5,
             a,b = max(0,start-context),min(total,end+context)
             inp.seek(a)
             block = inp.read(b-a,dtype='float64')
-            generated = np.asarray(infer(block),dtype='float64').reshape(-1)
+            generated = infer(block,start,end) if with_positions else infer(block)
+            generated = np.asarray(generated,dtype='float64').reshape(-1)
             left,right = max(0,start-fade),min(total,end+fade)
             segment = generated[left-a:right-a]
             if len(segment) != right-left or not np.isfinite(segment).all():

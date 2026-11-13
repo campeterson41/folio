@@ -3,8 +3,9 @@
 No comparison recording, transcript, manual repair times or private audio is
 required. A user-supplied keep list is optional; without one the clock is kept.
 """
+from functools import partial
 from pathlib import Path
-import math
+import math,shutil
 import numpy as np
 import soundfile as sf
 from scipy import signal,ndimage
@@ -14,18 +15,39 @@ from .streaming import windows
 
 
 class Renderer:
-    def __init__(self,workdir,preset,progress=None):
+    def __init__(self,workdir,preset,progress=None,denoise_segments=1):
         self.root=Path(workdir);self.preset=preset;self.steps=[]
         self.progress=progress or (lambda *a:None)
+        self.denoise_segments=denoise_segments
+        self.stems=set();self.peak_bytes=0
 
     def path(self,name):
-        return self.root/(name+'.wav')
+        path=self.root/(name+'.wav');self.stems.add(path);return path
+
+    def usage(self):
+        total=0
+        for path in self.root.rglob('*'):
+            try:
+                if path.is_file():total+=path.stat().st_size
+            except OSError:pass
+        self.peak_bytes=max(self.peak_bytes,total);return total
+
+    def release(self,*keep):
+        """Delete this renderer's stems that no later stage reads.
+
+        Only files created through ``path`` are removed, never the model's
+        working files or anything else in the directory. Temporary disk use
+        then follows the largest stage instead of the whole recipe.
+        """
+        self.usage();keep={Path(p) for p in keep}
+        for path in self.stems-keep:path.unlink(missing_ok=True)
+        self.stems&=keep
 
     def announce(self,label):
         self.progress(label,0)
 
     def tone(self,source,name,profile,subtype='DOUBLE'):
-        return A.transform(source,self.path(name),lambda x:dsp.apply_tone(x,profile),subtype=subtype)
+        return A.transform(source,self.path(name),partial(dsp.apply_tone,profile=profile),subtype=subtype,workers=True)
 
     def norm(self,source,name,speech,target=-23,subtype='DOUBLE'):
         return A.normalize(source,self.path(name),speech,target,subtype)
@@ -41,14 +63,17 @@ class Renderer:
         if preview_gain is None:
             preview_gain=A.preview_gain(source,warm,p['source_preview']['target_dbfs'])
         A.gain(warm,pre,preview_gain)
+        self.usage();shutil.rmtree(work)
         details['preview_gain_db']=preview_gain
         details['preview_gain_method']='saved-override' if self.saved_preview_gain else 'robust-percentile-speech'
         preview=self.limited(pre,'source-preview',p['source_preview']['peak_db'],100)
-        peak=20*math.log10(max(A.stats(preview)['true_peak'],1e-12))
+        true_peak=A.stats(preview)['true_peak']
+        peak=20*math.log10(max(true_peak,1e-12))
         ceiling=p['source_preview']['true_peak_db']
         if peak>ceiling:
             preview=self.limited(preview,'source-preview-second',ceiling-(peak-ceiling)-1,100)
-        if A.stats(preview)['true_peak']>10**((ceiling+.001)/20):
+            true_peak=A.stats(preview)['true_peak']
+        if true_peak>10**((ceiling+.001)/20):
             raise ValueError('Source preview exceeds true-peak ceiling')
         quantized=self.path('source-preview-pcm');A.gain(preview,quantized,0,'PCM_24');preview=quantized
         cut=self.path('source-cut');A.cut(preview,cut,edits)
@@ -72,7 +97,8 @@ class Renderer:
             current,_=self.norm(current,f'source-level-{i}',speech)
             current=self.limited(current,f'source-peak-{i}',settings['peak_ceiling_dbfs'])
         pre_df,_=self.norm(current,'source-pre-denoise',speech,subtype='PCM_24')
-        wet=self.path('source-denoised');df=E.denoise(pre_df,wet,binary,self.root/'source-model')
+        wet=self.path('source-denoised')
+        df=E.denoise(pre_df,wet,binary,self.root/'source-model',self.denoise_segments)
         mixed=self.path('source-denoised-bass')
         taps=signal.firwin(2049,200,fs=48000,window=('kaiser',7.5))
         with sf.SoundFile(wet) as a,sf.SoundFile(pre_df) as b,A.writer(mixed,sf.info(wet).frames) as out:
@@ -86,7 +112,7 @@ class Renderer:
         current=self.limited(current,'source-post-tone-peak',settings['peak_ceiling_dbfs'])
         stem12,_=self.norm(current,'source-complete',speech,subtype='PCM_24')
         toned=self.tone(stem12,'source-eq',p['source_eq'])
-        target=20*math.log10(A.stats(stem12,speech)['rms'])
+        target=20*math.log10(A.stats(stem12,speech,true_peak=False)['rms'])
         stem13,_=self.norm(toned,'source-eq-level',speech,target,'PCM_24')
         return stem13,pre_df,post_df,df_gain,df
 
@@ -113,7 +139,7 @@ class Renderer:
                 out.write(x+r*w)
         compressed=self.path('dense-compressed');c=p['compression']
         details=A.compress(relaxed,compressed,c['ratio'],c['threshold_dbfs'],c['attack_ms'],c['release_ms'],c['knee_db'],c['parallel_wet'])
-        target=20*math.log10(A.stats(stem,speech)['rms'])
+        target=20*math.log10(A.stats(stem,speech,true_peak=False)['rms'])
         current,_=self.norm(compressed,'dense-level',speech,target)
         current=self.limited(current,'dense-peak',p['voice']['peak_ceiling_dbfs'],100)
         dense,_=self.norm(current,'dense',speech,target,'PCM_24')
@@ -131,7 +157,7 @@ class Renderer:
         A.gain(early,self.path('early-reference'),0,'PCM_24')
         focused=self.path('repair-focused');E.room_file(dense,focused,high_focus=True)
         repair=self.tone(focused,'repair-tone',p['repair_tone'])
-        target=20*math.log10(A.stats(early,speech)['rms'])
+        target=20*math.log10(A.stats(early,speech,true_peak=False)['rms'])
         repair,_=self.norm(repair,'repair-level',speech,target)
         weight=E.repair_weight(early,repair,speech,regions,mapping)
         blend=self.path('early-repaired');E.crossblend(early,repair,blend,weight)
@@ -163,9 +189,10 @@ class Renderer:
         dry=self.path('early-without-bed');A.add(early,bed,dry,other_gain=-1)
         guide=self.path('cleanup-guide');A.add(dense,dry,guide,.2,.8,'FLOAT')
         selected=self.path('selected-blend');A.add(dense,dry,selected,blend,1-blend,'FLOAT')
-        model=self.path('cleanup-model');info=E.denoise(guide,model,binary,self.root/'final-model')
+        model=self.path('cleanup-model')
+        info=E.denoise(guide,model,binary,self.root/'final-model',self.denoise_segments)
         cleaned=self.path('cleaned');E.cleanup(selected,guide,model,cleaned,speech)
-        target=20*math.log10(A.stats(dense,speech)['rms'])
+        target=20*math.log10(A.stats(dense,speech,true_peak=False)['rms'])
         voice,db=self.norm(cleaned,'final-voice',speech,target)
         final=self.path('studio-final');A.add(voice,bed,final,other_gain=fuzz,subtype='PCM_24')
         return final,dict(final_voice_gain_db=db,cleanup=info)
@@ -180,16 +207,22 @@ class Renderer:
         raw=self.path('original-edited');mapping=A.cut(source,raw,edits)
         speech,mask_details=A.activity_mask(raw)
         if speech.sum()<10:raise ValueError('Not enough speech')
-        steady,source_info=self.source_voice(source,speech,edits,preview_gain)
-        stem,pre,post,df_gain,denoise_info=self.source_finish(steady,speech,binary)
-        dense,density_info=self.dense_voice(stem,pre,post,df_gain,speech)
+        frames=sf.info(raw).frames;self.release()
+        # Everything up to the dense voice comes from the recording alone, so a
+        # model process started by the caller can run beside these stages.
+        steady,source_info=self.source_voice(source,speech,edits,preview_gain);self.release(steady)
+        stem,pre,post,df_gain,denoise_info=self.source_finish(steady,speech,binary);self.release(stem,pre,post)
+        dense,density_info=self.dense_voice(stem,pre,post,df_gain,speech);self.release(dense)
+        if callable(native):native=native()
         foundation,repair_info=self.early_voice(source,native,speech,mapping,edits,dense,regions)
-        early,bed=self.early_finish(foundation,speech)
-        final,final_info=self.final_blend(dense,early,bed,speech,binary,blend,fuzz)
+        self.release(dense,foundation)
+        early,bed=self.early_finish(foundation,speech);self.release(dense,early,bed)
+        final,final_info=self.final_blend(dense,early,bed,speech,binary,blend,fuzz);self.release(final)
         metrics=A.stats(final,speech)
-        if metrics['samples']!=sf.info(raw).frames or metrics['true_peak']>=.99:
+        if metrics['samples']!=frames or metrics['true_peak']>=.99:
             raise ValueError('Studio output failed clock/peak verification')
         return final,dict(samples=metrics['samples'],metrics=metrics,source=source_info,
+            temporary_peak_bytes=self.peak_bytes,
             blend_fraction=blend,fuzz_fraction=fuzz,density=density_info,
             speech_protection=repair_info,first_denoise=denoise_info,**final_info,
             speech_edited=edits is not None,reference_audio_read=False,

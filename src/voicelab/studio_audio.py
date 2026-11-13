@@ -3,13 +3,14 @@
 Audio buffers are bounded; global level/gain decisions use coarse frame arrays.
 The original recording and all pre-existing outputs are treated as read-only.
 """
+from collections import deque
 from pathlib import Path
 import math
 import numpy as np
 import soundfile as sf
 from scipy import ndimage
-from . import dsp
-from .streaming import windows, TruePeakMeter
+from . import dsp, parallel
+from .streaming import windows, Stem, TruePeakMeter
 
 RATE = 48000
 BLOCK = RATE * 30
@@ -19,7 +20,7 @@ class CheckedWriter:
     def __init__(self,path,frames,subtype):
         self.pcm=subtype.startswith('PCM_')
         self.path=Path(path)
-        self.file=sf.SoundFile(path,'w',samplerate=RATE,channels=1,subtype=subtype,
+        self.file=Stem(path,'w',samplerate=RATE,channels=1,subtype=subtype,
             format='RF64' if frames*8>3900000000 else 'WAV')
     def write(self,x):
         if not np.isfinite(x).all():raise ValueError('Non-finite audio before write')
@@ -34,12 +35,26 @@ def writer(path,frames,subtype='DOUBLE'):
     return CheckedWriter(path,frames,subtype)
 
 
-def transform(source, target, function, context=.1, chunk=30, subtype='DOUBLE', position=False):
+def _apply(function, x, position):
+    return function(x) if position is None else function(x, position)
+
+
+def transform(source, target, function, context=.1, chunk=30, subtype='DOUBLE', position=False,
+              workers=False):
+    """Window-by-window file transform. ``workers=True`` uses the shared pool and
+    needs a picklable function; each window is computed exactly as it is inline."""
     info = sf.info(source)
     with writer(target, info.frames, subtype) as out:
-        for start, end, x, crop in windows(source, chunk, context):
-            y = function(x, start-crop.start) if position else function(x)
-            if len(y) != len(x) or not np.isfinite(y).all():
+        placed = deque()
+
+        def tasks():
+            for start, end, x, crop in windows(source, chunk, context):
+                placed.append((crop, len(x)))
+                yield function, x, (start-crop.start if position else None)
+
+        for y in parallel.imap(_apply, tasks(), enabled=workers):
+            crop, length = placed.popleft()
+            if len(y) != length or not np.isfinite(y).all():
                 raise ValueError('Processing changed the clock or produced non-finite samples')
             out.write(y[crop])
     if sf.info(target).frames != info.frames:
@@ -61,21 +76,24 @@ def mask(source):
     return dsp.speech_mask_energy(envelopes(source))
 
 
-def stats(source, speech=None):
-    energy=0.; count=0; peak=0.; meter=TruePeakMeter()
+def stats(source, speech=None, true_peak=True):
+    """Level statistics. ``true_peak=False`` skips the 4x oversampled estimate
+    for callers that only read ``rms`` or ``peak``."""
+    energy=0.; count=0; peak=0.; meter=TruePeakMeter() if true_peak else None
     with sf.SoundFile(source) as f:
         for start in range(0, f.frames, BLOCK):
             x=f.read(BLOCK)
             if not np.isfinite(x).all():
                 raise ValueError('Non-finite audio')
             peak=max(peak,float(np.max(abs(x),initial=0)))
-            meter.update(x)
+            if meter is not None:meter.update(x)
             if speech is not None:
                 indexes=np.minimum(np.arange(start,start+len(x))//480,len(speech)-1)
                 x=x[speech[indexes]]
             energy+=float(np.sum(x*x)); count+=len(x)
     return dict(rms=math.sqrt(energy/max(1,count)), peak=peak,
-                true_peak=meter.finish(), samples=sf.info(source).frames)
+                true_peak=meter.finish() if meter is not None else None,
+                samples=sf.info(source).frames)
 
 
 def gain(source, target, db, subtype='DOUBLE'):
@@ -84,7 +102,7 @@ def gain(source, target, db, subtype='DOUBLE'):
 
 
 def normalize(source, target, speech, target_db=-23, subtype='DOUBLE'):
-    rms=stats(source,speech)['rms']
+    rms=stats(source,speech,true_peak=False)['rms']
     if rms<1e-10:
         raise ValueError('No usable speech for level matching')
     db=target_db-20*math.log10(rms)

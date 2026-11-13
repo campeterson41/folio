@@ -31,9 +31,10 @@ pauses for source noise estimation. Output is a **24-bit WAV** and a JSON receip
 No words or retakes are removed by default: the sample count stays unchanged.
 Existing files are never overwritten. Audio is processed in bounded windows;
 coarse decision arrays and temporary disk usage grow with the take's duration.
-Allow about 1.5 GiB per input minute in temporary free disk space and substantial
-processing time; the command checks available space before starting. CPU model inference is available with `--device cpu`, but has not been
-benchmarked for chapter-length takes.
+Allow about 0.6 GiB per input minute in temporary free disk space; the command
+checks available space before starting, and stems are deleted as soon as no later
+stage reads them. `--device cpu` runs the model without a GPU; see
+[Speed and quality tiers](#speed-and-quality-tiers) for measured times.
 
 The official preset is [`presets/studio-v1.json`](presets/studio-v1.json).
 It contains numerical EQ curves, dynamics settings and a deterministic noise
@@ -61,10 +62,92 @@ It never reads an Auphonic waveform at runtime. Neural processing may alter fine
 speech detail, and the denoiser has a 16-bit intermediate; a 24-bit final file
 does not imply lossless restoration.
 
+### Speed and quality tiers
+
+`--quality` chooses how much work the restoration model does. The default,
+`reference`, is the approved recipe.
+
+```sh
+bin/folio --input chapter.wav --output chapter-studio.wav --quality balanced
+```
+
+| `--quality` | Model input | GPU machine, whole run per audio minute | CPU only, model time per audio minute | Difference from the `reference` render | Largest octave-band shift |
+| --- | --- | ---: | ---: | --- | --- |
+| v0.3 | 48 kHz | 130 s | 13.6 min | | |
+| `reference` | 48 kHz | 74 s | 11.9 min | none (identical samples) | none |
+| `high` | 48 kHz | 64 s | 9.4 min | 73 to 77 dB below the signal | under 0.01 dB |
+| `balanced` | 24 kHz | 62 s | 7.6 min | 33 to 35 dB below | 0.4 to 0.9 dB |
+| `fast` | 16 kHz | 62 s | 6.0 min | 28 to 30 dB below | 8–16 kHz quieter by 2.4 to 5.0 dB |
+| `draft` | 8 kHz | 60 s | 4.4 min | 23 to 26 dB below | 8–16 kHz quieter by 1.9 to 3.2 dB, 4–8 kHz by 1.3 to 1.6 dB |
+
+**What stays fixed.** Every tier runs the same recipe, preset, blend, repair
+detector and floor. `reference` also keeps the v0.3 arithmetic, and its output
+does not depend on `--workers`. On CPU it evaluates the model with the same four
+threads and the same operations as v0.3, minus attention-mask bookkeeping that
+never changed a value; the stem was bit-identical on the machine tested.
+
+Against v0.3 itself, the `reference` file was byte-identical (same SHA-256) on
+the 60 s and ten-minute takes tested on Linux and 97 dB below the signal on a
+five-minute take on macOS. The cause is in v0.3: its room-prediction sums change
+with the number of BLAS threads, so its own render changes with the machine's
+core count. This version runs those sums on one thread, which removes that
+dependence.
+
+**What the other tiers change.**
+
+- *Model bandwidth.* `balanced`, `fast` and `draft` resample each model window
+  to 24, 16 or 8 kHz before restoration, and the model regenerates everything
+  above 12, 8 or 4 kHz at 48 kHz output. 16 kHz and 8 kHz input are the
+  conditions the public checkpoint was trained on; 24 kHz is not. The model's
+  stem is 22% of the mix, and the consonant repair still compares it with the
+  full-band source. `draft` is for checking edits and levels, not for release.
+- *Model evaluation.* Outside `reference`, blocks are evaluated a few sequences
+  at a time (same weights, float32 rounding differences), which cuts peak model
+  memory on CPU from about 6 GiB to about 1.2 GiB, and all physical cores are
+  used. On CUDA the network runs in float16 autocast; the STFT stays float32.
+- *Denoiser.* Outside `reference`, takes longer than four minutes run the
+  denoiser on consecutive segments at once. Each segment starts 20 s early and
+  joins are crossfaded over 50 ms; the result sits about 60 dB below the
+  single-pass output rather than matching it.
+- *Silent windows.* Outside `reference`, a 3 s model window is left silent when
+  neither activity detector finds speech within half a second of it. Narration
+  rarely has such windows; recordings with long gaps do.
+
+**How this was measured.** The GPU machine is a Tesla T4 with two CPU cores,
+timed end to end on a ten-minute LibriVox take (*Moby Dick*, chapters 1–2) with
+`tools/benchmark_studio.py`. With only two cores the audio stages set the pace
+there, so tiers below `high` gain little; the model itself took 2.33 s per 3 s
+window in `reference`, 1.22 s in `high`, 0.98 s in `balanced`, 0.75 s in `fast`
+and 0.53 s in `draft`. The CPU column is an Intel Core i5-10400 (6 cores): v0.3
+was timed on a whole 60 s take, the tiers per window on the idle machine and
+multiplied out, because the machine was shared. On CPU the model is about 95% of
+the run. Differences were measured on two speakers (60 s each, plus the
+ten-minute take) as the residual against the `reference` render and as the
+largest level change in any octave band during speech. DNSMOS P.835, which only
+hears up to 8 kHz, scored every tier within 0.01 of `reference` on all three
+takes (3.49 to 3.50, 3.48 to 3.49 and 3.35 to 3.36 overall).
+
+Silent-window skipping was checked on a take with two inserted ten-second
+room-tone pauses: four of 27 windows were skipped and the render moved by
+121 dB below the signal, with speech samples unchanged.
+
+The distances say how far a tier moved from the approved render. They are not
+listening results: no tier other than `reference` has been auditioned, so
+audition a faster tier against `reference` on a passage of your own recording
+before using it for release. `tools/benchmark_studio.py --input take.wav
+--workdir bench` repeats the timing and distance table on your machine and take.
+
+`--workers N` sets how many independent audio windows are processed at once
+(default: CPU count minus one, at most 8). `--threads N` sets the model's CPU
+threads. Neither changes the `reference` output file for a given model stem;
+`--threads` other than 4 changes the CPU stem at float32 rounding level
+(about 127 dB below the signal in the take tested).
+
 ### Saved sessions and reproduction
 
 `--native-stem native.wav` reuses TF inference only after checking its adjacent
-JSON receipt, source hash, recipe and output hash. `--edit-list edits.json` takes
+JSON receipt, source hash, recipe and output hash, and that the stem was made
+with the model settings of the requested `--quality`. `--edit-list edits.json` takes
 an optional sample-index keep list. For example, a **synthetic** ten-second take:
 
 ```json

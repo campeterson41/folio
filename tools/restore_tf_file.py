@@ -14,9 +14,12 @@ os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY','1')
 import numpy as np
 import soundfile as sf
 import torch
+from voicelab import tf_fast
 from voicelab.chunks import restore_file
 from voicelab.streaming import sha
 from voicelab.f_artifacts import runtime_root
+
+MODEL_RATES=(48000,32000,24000,16000,8000)
 
 
 def main():
@@ -24,7 +27,18 @@ def main():
     ap.add_argument('--input',type=Path,required=True)
     ap.add_argument('--output',type=Path,required=True)
     ap.add_argument('--device',choices=['cpu','cuda'],default='cuda')
+    ap.add_argument('--threads',type=int,help='CPU threads (default: PyTorch default, one per physical core)')
+    ap.add_argument('--forward',choices=['stock','lean','sliced'],default='stock',
+        help='stock: vendored forward pass. lean: same arithmetic without attention-mask bookkeeping '
+             '(CPU). sliced: lean plus cache-sized block slices (float32 rounding differences, far less memory)')
+    ap.add_argument('--model-rate',type=int,choices=MODEL_RATES,default=48000,
+        help='Bandwidth given to the model. Below 48000 the model regenerates the missing upper band')
+    ap.add_argument('--precision',choices=['float32','float16'],default='float32',
+        help='float16 autocast for the network on CUDA; the STFT stays float32')
+    ap.add_argument('--skip',type=Path,help='JSON list of [start,end) sample windows on the 3 s grid to leave silent')
     args=ap.parse_args()
+    if args.precision=='float16' and args.device!='cuda':ap.error('--precision float16 needs --device cuda')
+    if args.threads is not None and args.threads<1:ap.error('--threads must be at least 1')
     receipt=args.output.with_suffix('.json')
     if args.output.exists() or receipt.exists():raise FileExistsError(args.output)
     info=sf.info(args.input)
@@ -33,12 +47,19 @@ def main():
     runtime=runtime_root()
     sys.path.insert(0,str(runtime/'vendor/TF_Restormer'))
     from tf_restormer import SEInference
-    torch.set_num_threads(4)
+    if args.threads:torch.set_num_threads(args.threads)
     torch.manual_seed(37)
     if args.device=='cuda':
         torch.cuda.set_per_process_memory_fraction(.82)
         torch.cuda.reset_peak_memory_stats()
     model=SEInference.from_pretrained(checkpoint_path=str(runtime/'models/tf-restormer'),device=args.device)
+    if args.forward!='stock':
+        # PyTorch's fused CUDA attention is already lean; only the CPU path is replaced.
+        if args.device=='cpu':tf_fast.lean_attention(model.engine.model)
+        if args.forward=='sliced':tf_fast.slice_blocks(model.engine.model,*tf_fast.slice_sizes(args.device))
+    skip=set()
+    if args.skip:
+        skip={(int(a),int(b)) for a,b in json.loads(args.skip.read_text())}
     source_hash=sha(args.input)
     start=time.monotonic()
     args.output.parent.mkdir(parents=True,exist_ok=True)
@@ -48,15 +69,24 @@ def main():
         if seconds-last[0]>=30:
             print(f'Restored {seconds:.1f} / {info.duration:.1f} s',flush=True)
             last[0]=seconds
-    def infer(block):
+    skipped=[0];window_seconds=[]
+    def restore(block):
+        if args.model_rate==48000 and args.precision=='float32':
+            result=model.process_waveform(torch.tensor(block,dtype=torch.float32)[None,:],
+                fs_in=48000,fs_out=48000,mode='single_pass')
+            return result['waveform'].detach().cpu().numpy().reshape(-1)
+        return tf_fast.restore_window(model,block,args.model_rate,args.precision)
+    def infer(block,start=None,end=None):
         input_peak[0]=max(input_peak[0],float(np.max(abs(block),initial=0)))
-        result=model.process_waveform(torch.tensor(block,dtype=torch.float32)[None,:],
-            fs_in=48000,fs_out=48000,mode='single_pass')
-        return result['waveform'].detach().cpu().numpy().reshape(-1)
+        if (start,end) in skip:
+            skipped[0]+=1;return np.zeros(len(block))
+        began=time.monotonic();restored=restore(block)
+        if len(block)==192000:window_seconds.append(time.monotonic()-began)
+        return restored
     with tempfile.TemporaryDirectory(prefix='voice-lab-tf-',dir=args.output.parent) as tmp:
         unscaled=Path(tmp)/'native-double.wav'
         with torch.inference_mode():
-            stats=restore_file(args.input,unscaled,infer,progress=progress)
+            stats=restore_file(args.input,unscaled,infer,progress=progress,with_positions=True)
         if stats['peak']<1e-9 and input_peak[0]>1e-5:
             raise RuntimeError('Model returned silence instead of input speech')
         gain=.98/stats['peak'] if stats['peak']>=.98 else 1.
@@ -71,7 +101,13 @@ def main():
         os.link(part,args.output)
     result={'id':'tf-file-native','family':'tf-restormer',
         'parameters':{'seconds':3.,'input_rate':48000,'context_seconds':.5,
-                      'crossfade_seconds':.08,'device':args.device,'input':str(args.input.resolve())},
+                      'crossfade_seconds':.08,'device':args.device,'input':str(args.input.resolve()),
+                      'model_input_rate':args.model_rate,'forward':args.forward,
+                      'precision':args.precision,'threads':torch.get_num_threads(),
+                      'skipped_windows':skipped[0]},
+        # Full 4 s windows only (the .cpu() copy ends each one); robust to a busy machine.
+        'window_seconds_median':float(np.median(window_seconds)) if window_seconds else None,
+        'window_seconds_fastest':float(np.min(window_seconds)) if window_seconds else None,
         'source_sha256':source_hash,'output_sha256':sha(args.output),
         'samples':info.frames,'runtime_seconds':time.monotonic()-start,
         'write_safety_gain_db':float(20*np.log10(gain)),
