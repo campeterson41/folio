@@ -4,8 +4,9 @@ from __future__ import annotations
 import hashlib, math
 import numpy as np
 import soundfile as sf
+from collections import deque
 from scipy import signal
-from . import dsp
+from . import dsp, parallel
 
 
 def sha(path):
@@ -14,6 +15,25 @@ def sha(path):
         for block in iter(lambda: f.read(1048576), b""):
             h.update(block)
     return h.hexdigest()
+
+
+class Stem(sf.SoundFile):
+    """A temporary stem. Closing it does not force the data to disk: stems are
+    read back by the next stage and deleted, so syncing each one only adds
+    writes. Published files are synced once, by their publisher."""
+
+    def flush(self):
+        pass
+
+
+def sync(path):
+    """Force a finished file to disk before it is published."""
+    import os
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def windows(path, chunk_seconds=30, context_seconds=4):
@@ -43,32 +63,59 @@ def speech_rms_file(path, chunk_seconds=30):
     return float(dsp.db(np.sqrt(np.mean(e[mask] ** 2)))) if mask.any() else None
 
 
+def _true_peak_block(joined, a, b):
+    high = signal.resample_poly(joined, 4, 1)
+    return float(np.max(abs(high[a:b]), initial=0))
+
+
 class TruePeakMeter:
-    """4x peak estimate across block joins with real context, no boundary zero padding."""
+    """4x peak estimate across block joins with real context, no boundary zero padding.
+
+    Each block is oversampled with the tail of the previous one, so blocks are
+    independent and can be measured by the window workers. The result is the
+    maximum of the same per-block values as a serial pass.
+    """
 
     def __init__(self):
         self.tail = np.empty(0)
         self.started = False
         self.peak = 0.0
+        self.pending = deque()
+
+    def _collect(self, limit):
+        while len(self.pending) > limit:
+            self.peak = max(self.peak, self.pending.popleft().result())
 
     def update(self, x):
         joined = np.concatenate((self.tail, x))
         if len(joined) <= 64:
             self.tail = joined.copy()
             return
-        high = signal.resample_poly(joined, 4, 1)
         a = 128 if self.started else 0
         b = (len(joined) - 32) * 4
-        self.peak = max(self.peak, float(np.max(abs(high[a:b]), initial=0)))
+        if parallel.workers() > 1:
+            self.pending.append(parallel.submit(_true_peak_block, joined, a, b))
+            self._collect(parallel.workers())
+        else:
+            self.peak = max(self.peak, _true_peak_block(joined, a, b))
         self.tail = joined[-64:].copy()
         self.started = True
 
     def finish(self):
+        self._collect(0)
         if len(self.tail):
             high = signal.resample_poly(self.tail, 4, 1)
             a = 128 if self.started else 0
             self.peak = max(self.peak, float(np.max(abs(high[a:]), initial=0)))
         return self.peak
+
+
+def _transformed(transform, x, position):
+    y = transform(x) if position is None else transform(x, position)
+    extra = None
+    if isinstance(y, tuple):
+        y, extra = y
+    return np.asarray(y, dtype="float64"), extra
 
 
 def stage(
@@ -82,17 +129,30 @@ def stage(
     crossfade_seconds=0.0,
     with_position=False,
     subtype="FLOAT",
+    true_peak=True,
+    workers=False,
+    extras=None,
+    durable=True,
 ):
+    """Transform ``source`` window by window into ``target``.
+
+    ``workers=True`` computes independent windows in the shared worker pool;
+    the transform must then be a picklable function of the window alone. A
+    transform may return ``(audio, extra)``; extras are appended to ``extras``
+    in window order. ``true_peak=False`` skips the 4x peak estimate for stages
+    whose callers only need RMS and sample peak. ``durable=False`` writes a
+    temporary stem without syncing it to disk.
+    """
     energy = 0.0
     peak = 0.0
     count = 0
-    meter = TruePeakMeter()
+    meter = TruePeakMeter() if true_peak else None
     pending = None
     total = sf.info(source).frames
     fade = round(crossfade_seconds * dsp.RATE)
     if fade > round(context_seconds * dsp.RATE):
         raise ValueError("Crossfade requires enough model context")
-    with sf.SoundFile(
+    with (sf.SoundFile if durable else Stem)(
         target, "w", samplerate=dsp.RATE, channels=1, subtype=subtype, format="RF64"
     ) as out:
 
@@ -104,14 +164,21 @@ def stage(
             energy += np.dot(y, y)
             peak = max(peak, float(np.max(abs(y), initial=0)))
             count += len(y)
-            meter.update(y)
+            if meter is not None:
+                meter.update(y)
 
-        for start, end, x, crop in windows(source, chunk_seconds, context_seconds):
-            transformed = np.asarray(
-                transform(x, start - crop.start) if with_position else transform(x),
-                dtype="float64",
-            )
-            if len(transformed) != len(x):
+        placed = deque()
+
+        def tasks():
+            for start, end, x, crop in windows(source, chunk_seconds, context_seconds):
+                placed.append((start, end, crop, len(x)))
+                yield transform, x, (start - crop.start if with_position else None)
+
+        for transformed, extra in parallel.imap(_transformed, tasks(), enabled=workers):
+            start, end, crop, length = placed.popleft()
+            if extras is not None:
+                extras.append(extra)
+            if len(transformed) != length:
                 raise ValueError("Model changed duration in " + phase)
             if not fade:
                 emit(transformed[crop])
@@ -145,5 +212,5 @@ def stage(
         "samples": count,
         "rms": math.sqrt(energy / max(1, count)),
         "peak": peak,
-        "estimated_true_peak_4x": meter.finish(),
+        "estimated_true_peak_4x": meter.finish() if meter is not None else None,
     }

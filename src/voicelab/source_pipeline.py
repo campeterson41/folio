@@ -20,6 +20,7 @@ Pipeline (each stage is streamed in aligned 30 s chunks with 2 s context):
 """
 from __future__ import annotations
 
+from functools import partial
 import math
 from pathlib import Path
 
@@ -178,6 +179,21 @@ def closer_warm(x, maximum_db, gain_db=3.):
     return signal.fftconvolve(closer(x, maximum_db), bass_taps(gain_db), mode='same')
 
 
+def _preserved_tone(x, noise, tone):
+    y = reduce_noise(x, noise, PRESERVED_REDUCTION_DB)
+    return dsp.apply_tone(dsp.highpass(y, HIGHPASS_HZ), tone)
+
+
+def _limited(x, gain):
+    y, meta = dsp.limit_peaks(x*gain, peak_db=PEAK_DB)
+    return y, meta['limiter_max_reduction_db']
+
+
+def _quieter_branch(x, noise, tone, gain):
+    y = dsp.apply_tone(dsp.highpass(clean_quieter(x, noise), HIGHPASS_HZ), tone)
+    return _limited(y, gain)
+
+
 def validate_preset(preset):
     tone = preset.get('tone')
     if not isinstance(tone, dict):
@@ -227,36 +243,25 @@ def render(source, workdir, preset, tail_db=6., bass_db=3., progress=None):
     chunk, context = CHUNK_SECONDS, CONTEXT_SECONDS
     reductions = {'preserved': [], 'quieter': []}
 
-    def preserved_tone(x):
-        y = reduce_noise(x, noise, PRESERVED_REDUCTION_DB)
-        return dsp.apply_tone(dsp.highpass(y, HIGHPASS_HZ), tone)
-
+    # Windows are independent, so the heavy branches use the worker pool. The
+    # sample-peak checks below never read the 4x estimate; only the finish does.
     toned = tmp/'preserved-toned.wav'
-    stage(source, toned, preserved_tone, progress, 'preserved branch',
-          chunk, context, subtype='DOUBLE')
-
-    def preserved_finish(x):
-        y, meta = dsp.limit_peaks(x*gain, peak_db=PEAK_DB)
-        reductions['preserved'].append(meta['limiter_max_reduction_db'])
-        return y
+    stage(source, toned, partial(_preserved_tone, noise=noise, tone=tone), progress,
+          'preserved branch', chunk, context, subtype='DOUBLE', true_peak=False, workers=True, durable=False)
 
     preserved = tmp/'preserved.wav'
-    m = stage(toned, preserved, preserved_finish, progress, 'preserved peak protection',
-              chunk, context, subtype='PCM_24')
+    m = stage(toned, preserved, partial(_limited, gain=gain), progress,
+              'preserved peak protection', chunk, context, subtype='PCM_24',
+              true_peak=False, workers=True, extras=reductions['preserved'], durable=False)
     _metrics_ok(m, samples, 'Preserved branch')
     toned.unlink()
     gains, settings = controls(raw, analyze(preserved))
     preserved.unlink()
 
-    def quieter_branch(x):
-        y = dsp.apply_tone(dsp.highpass(clean_quieter(x, noise), HIGHPASS_HZ), tone)
-        y, meta = dsp.limit_peaks(y*gain, peak_db=PEAK_DB)
-        reductions['quieter'].append(meta['limiter_max_reduction_db'])
-        return y
-
     quieter = tmp/'quieter.wav'
-    stage(source, quieter, quieter_branch, progress, 'quieter branch',
-          chunk, context, subtype='DOUBLE')
+    stage(source, quieter, partial(_quieter_branch, noise=noise, tone=tone, gain=gain),
+          progress, 'quieter branch', chunk, context, subtype='DOUBLE',
+          true_peak=False, workers=True, extras=reductions['quieter'], durable=False)
 
     def level_control(x, start):
         curve = np.interp((start+np.arange(len(x)))/ANALYSIS_HOP,
@@ -265,13 +270,14 @@ def render(source, workdir, preset, tail_db=6., bass_db=3., progress=None):
 
     controlled = tmp/'controlled.wav'
     m = stage(quieter, controlled, level_control, progress, 'level control',
-              chunk, context, with_position=True, subtype='PCM_24')
+              chunk, context, with_position=True, subtype='PCM_24', true_peak=False, durable=False)
     _metrics_ok(m, samples, 'Level control')
     quieter.unlink()
 
     final = tmp/'final.wav'
-    metrics = stage(controlled, final, lambda x: closer_warm(x, tail_db, bass_db),
-                    progress, 'closer-warm finish', chunk, context, subtype='PCM_24')
+    metrics = stage(controlled, final, partial(closer_warm, maximum_db=tail_db, gain_db=bass_db),
+                    progress, 'closer-warm finish', chunk, context, subtype='PCM_24',
+                    workers=True, durable=False)
     _metrics_ok(metrics, samples, 'Closer-warm finish')
     if metrics['estimated_true_peak_4x'] >= .99:
         raise ValueError('Insufficient true-peak headroom after the bass shelf; '

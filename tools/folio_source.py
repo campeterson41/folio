@@ -21,15 +21,16 @@ import soundfile as sf
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'src'))
 from voicelab import __version__  # noqa: E402
+from voicelab import parallel  # noqa: E402
 from voicelab import source_pipeline as pipeline  # noqa: E402
-from voicelab.streaming import sha  # noqa: E402
+from voicelab.streaming import sha, sync  # noqa: E402
 
 RECIPE = 'folio-source-v1'
 DEFAULT_PRESET = ROOT/'presets/source-narration-v1.json'
 MINIMUM_SECONDS = 5
 IMPLEMENTATION = [Path(__file__).resolve(), ROOT/'src/voicelab/source_pipeline.py',
                   ROOT/'src/voicelab/dsp.py', ROOT/'src/voicelab/streaming.py',
-                  ROOT/'src/voicelab/adaptive.py']
+                  ROOT/'src/voicelab/adaptive.py', ROOT/'src/voicelab/parallel.py']
 
 
 def inspect_input(path, block=1048576):
@@ -69,8 +70,13 @@ def main(argv=None):
                     help='Late-tail attenuation cap, 0–6 dB (preset default 6)')
     ap.add_argument('--bass-db', type=float,
                     help='160 Hz low-shelf gain, 0–4 dB (preset default 3)')
+    ap.add_argument('--workers', type=int,
+                    help='Processes for independent audio windows (default: CPUs minus '
+                         'one, at most 8). The output file does not depend on it')
     ap.add_argument('--quiet', action='store_true', help='No progress output')
     args = ap.parse_args(argv)
+    if args.workers is not None and args.workers < 1:
+        ap.error('--workers must be at least 1')
     preset = json.loads(args.preset.read_text())
     tail = preset.get('tail_db', 6.) if args.tail_db is None else args.tail_db
     bass = preset.get('bass_db', 3.) if args.bass_db is None else args.bass_db
@@ -98,9 +104,11 @@ def main(argv=None):
             except BlockingIOError:
                 raise FileExistsError('This output is already being processed')
             try:
+                parallel.configure(args.workers)
                 process(source, output, receipt, args.preset, preset, float(tail),
                         float(bass), args.quiet)
             finally:
+                parallel.shutdown()
                 # Removed while still held; a late contender that locks the old
                 # inode still cannot publish over the exclusive hard links.
                 lock_path.unlink(missing_ok=True)
@@ -166,6 +174,7 @@ def process(source, output, receipt, preset_path, preset, tail, bass, quiet=Fals
         }
         meta = Path(tmp)/'receipt.json'
         meta.write_text(json.dumps(metadata, indent=2)+'\n')
+        sync(final)  # intermediate stems are not synced; the published file is
         # Exclusive hard links publish complete files and never replace a file
         # that appeared while processing. The temporary directory shares the FS.
         try:

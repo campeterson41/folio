@@ -1,4 +1,5 @@
 """File-backed F mastering, retaining the approved global level decisions."""
+from functools import partial
 import math
 from pathlib import Path
 import tempfile
@@ -8,6 +9,14 @@ import soundfile as sf
 from scipy import signal
 from . import dsp
 from .streaming import stage, windows
+
+
+def _tone(x, cutoff, profile, strength):
+    return dsp.apply_tone(dsp.highpass(x, cutoff), profile, strength)
+
+
+def _compress(x, gain, ratio):
+    return dsp.compress(x*gain, ratio=ratio)[0]
 
 
 def master_file(source, target, preset, chunk_seconds=30,
@@ -27,13 +36,12 @@ def master_file(source, target, preset, chunk_seconds=30,
     with tempfile.TemporaryDirectory(prefix='voice-lab-f-master-',dir=target.parent) as tmp:
         tmp=Path(tmp)
         toned=tmp/'toned.wav'
-        def tone(x):
-            return dsp.apply_tone(dsp.highpass(x,settings.get('cutoff',50)),
-                                  profile,settings.get('tone_strength',1))
+        tone=partial(_tone,cutoff=settings.get('cutoff',50),profile=profile,
+                     strength=settings.get('tone_strength',1))
         def run(src,dst,fn,phase,**kwargs):
             return stage(src,dst,fn,progress,phase,chunk_seconds,
-                         context_seconds=4,subtype='DOUBLE',**kwargs)
-        run(source,toned,tone,'tone')
+                         context_seconds=4,subtype='DOUBLE',durable=False,**kwargs)
+        run(source,toned,tone,'tone',true_peak=False,workers=True)
         levels=[];voices=[]
         for _,_,x,crop in windows(toned,chunk_seconds,4):
             c=slice(crop.start//480,math.ceil(crop.stop/480))
@@ -47,15 +55,15 @@ def master_file(source, target, preset, chunk_seconds=30,
             g=np.interp((np.arange(len(x))+position)/48000,
                         np.arange(len(global_gain))*.01,global_gain)
             return x*10**(g/20)
-        stats=run(toned,leveled,level,'level',with_position=True)
+        stats=run(toned,leveled,level,'level',with_position=True,true_peak=False)
         target_db=settings.get('target_db',-20)
         peak_db=settings.get('peak_db',-4)
         pre_gain=min(target_db-float(dsp.db(stats['rms'])),
                      -float(dsp.db(stats['peak']))) if stats['rms']>1e-7 else 0.
         compressed=tmp/'compressed.wav'
         stats=run(leveled,compressed,
-            lambda x:dsp.compress(x*10**(pre_gain/20),ratio=settings.get('ratio',1.3))[0],
-            'compress')
+            partial(_compress,gain=10**(pre_gain/20),ratio=settings.get('ratio',1.3)),
+            'compress',workers=True)
         gain=min(target_db-float(dsp.db(stats['rms'])),
                  peak_db-float(dsp.db(max(stats['peak'],stats['estimated_true_peak_4x'])))) if stats['rms']>1e-7 else 0.
         intermediate=tmp/'f-pcm24.wav'

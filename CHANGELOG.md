@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — faster long takes, speed/quality tiers
+
+- Process independent audio windows in a worker pool, keep the numeric
+  libraries single-threaded for the tiny per-bin solves, measure true peak only
+  where it is read, and run the model beside the source-only stages. The
+  `reference` render no longer depends on worker or core count; against 0.3.0 it
+  was byte-identical on the 60 s and ten-minute takes tested on Linux and within
+  rounding (-97 dB) on a five-minute take on macOS, because 0.3.0's result
+  varied with the BLAS thread count.
+  `bin/folio-source` uses the same pool and its output file is unchanged.
+- Delete intermediate stems as soon as no later stage reads them, and stop
+  syncing each one to disk. Peak temporary disk drops from about 1.1 GiB to
+  about 0.35 GiB per input minute.
+- Add `--quality reference|high|balanced|fast|draft`, `--workers` and `--threads`.
+  `reference` remains the default and the approved sound. Receipts record the
+  tier, model input rate, precision, threads and per-window model time.
+- CPU inference no longer runs attention-mask bookkeeping (bit-identical), and
+  tiers other than `reference` evaluate blocks in cache-sized slices, cutting
+  peak model memory from about 6 GiB to about 1.2 GiB.
+- Add `tools/benchmark_studio.py` to time tiers on a take and measure each
+  render's distance from the reference render.
+
 ## 0.3.0 — Folio Studio
 
 - Make `bin/folio` run the official Studio recipe, also available as

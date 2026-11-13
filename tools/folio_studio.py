@@ -14,16 +14,23 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'src'))
+from voicelab import parallel
+parallel.serial_numeric_libraries()  # before NumPy loads; window workers supply the parallelism
 import soundfile as sf
-from voicelab import __version__
+from voicelab import __version__, tiers
 from voicelab.studio_pipeline import Renderer
-from voicelab.studio_effects import run_child
+from voicelab.studio_effects import Children
 from voicelab import studio_audio as audio
-from voicelab.streaming import sha
+from voicelab.streaming import sha, sync
 from voicelab.conservative import binary
 from voicelab.f_artifacts import runtime_root, verify as verify_artifacts
 from folio_source import inspect_input, _interrupt
 from enhance_f import validate_native
+
+
+# Largest number of full-length DOUBLE stems alive at once, with headroom
+# (measured peak is recorded in each receipt as temporary_peak_bytes).
+TEMPORARY_STEMS = 26
 
 
 def repair_regions(value, frames):
@@ -52,7 +59,40 @@ def preflight_source(source):
         raise ValueError('Quiet regions are within 15 dB of speech; record clean room tone between phrases')
 
 
+def silent_windows(source, core=3., context=.5):
+    """Model windows whose core and context hold no detected speech.
+
+    Uses the union of both activity detectors on the raw take, so a window is
+    only left out when neither finds speech within half a second of it.
+    """
+    import numpy as np
+    speech=audio.robust_speech_mask(source);energy=audio.mask(source)
+    n=min(len(speech),len(energy));speech=speech[:n]|energy[:n]
+    frames=sf.info(source).frames;stride=round(core*48000);margin=round(context*48000)
+    skipped=[]
+    for start in range(0,frames,stride):
+        end=min(frames,start+stride)
+        a=max(0,start-margin)//480;b=min(n,-(-(end+margin)//480))
+        if not speech[a:b].any():skipped.append([start,end])
+    return skipped
+
+
+def model_command(source, native, args, settings, skip=None):
+    command=[sys.executable,str(ROOT/'tools/restore_tf_file.py'),'--input',str(source),
+        '--output',str(native),'--device',args.device,'--forward',settings['forward'],
+        '--model-rate',str(settings['model_rate']),'--precision',settings['precision']]
+    threads=getattr(args,'threads',None) or settings['threads']
+    if threads:command+=['--threads',str(threads)]
+    if skip is not None:command+=['--skip',str(skip)]
+    return command
+
+
 def process(args):
+    try:return render_take(args)
+    finally:parallel.shutdown()
+
+
+def render_take(args):
     source=args.input.resolve();output=args.output;receipt=output.with_suffix('.json')
     if output.suffix.lower()!='.wav':raise ValueError('Use a .wav output')
     for p in (output,receipt):
@@ -64,8 +104,9 @@ def process(args):
     edits=json.loads(args.edit_list.read_text()) if args.edit_list else None
     audio.validate_edits(edits,info.frames)
     regions=repair_regions(json.loads(args.repair_regions.read_text()),info.frames) if args.repair_regions else None
-    # Conservative preflight: bounded RAM, but many file-backed stages.
-    required=info.frames*8*70
+    settings=tiers.resolve(getattr(args,'quality',tiers.DEFAULT),getattr(args,'device','cuda'))
+    # Conservative preflight: bounded RAM, file-backed stages released as they finish.
+    required=info.frames*8*TEMPORARY_STEMS
     if shutil.disk_usage(output.parent).free<required:
         raise OSError(f'Studio needs about {required/1024**3:.1f} GiB temporary free space for this take')
     runtime=runtime_root();executable=binary(runtime)
@@ -73,22 +114,40 @@ def process(args):
         if not args.quiet:print(f'{phase}: {seconds:.1f}s',file=sys.stderr,flush=True)
     preflight_source(source)
     artifacts=None
-    with tempfile.TemporaryDirectory(prefix='.folio-studio-',dir=output.parent) as tmp:
-        root=Path(tmp);native=args.native_stem or root/'native.wav'
-        if not args.native_stem:
+    workers=parallel.configure(getattr(args,'workers',None))
+    segments=workers if settings['denoise_segments'] else 1
+    # Leaving the block stops a running model before its working files are removed.
+    with tempfile.TemporaryDirectory(prefix='.folio-studio-',dir=output.parent) as tmp,Children() as children:
+        root=Path(tmp);native=args.native_stem or root/'native.wav';skipped=None
+        def checked_native():
+            receipt=validate_native(native,source_hash,info.frames)
+            if not tiers.stem_matches(receipt['parameters'],settings):
+                raise ValueError(f"Cached native stem was not made for --quality {settings['tier']}")
+            return receipt
+        if args.native_stem:
+            checked_native()
+            ready=native
+        else:
             artifacts=verify_artifacts(runtime)
-            run_child([sys.executable,str(ROOT/'tools/restore_tf_file.py'),
-                '--input',str(source),'--output',str(native),'--device',args.device])
-        native_receipt=validate_native(native,source_hash,info.frames)
+            if settings['skip_silence']:
+                skipped=silent_windows(source)
+                (root/'skip.json').write_text(json.dumps(skipped))
+            # The model runs beside the source-only stages and is awaited when
+            # the recipe first needs its stem.
+            child=children.start(model_command(source,native,args,settings,root/'skip.json' if skipped is not None else None),
+                parallel.model_environment())
+            def ready():
+                child.wait();return native
+        final,details=Renderer(root,preset,progress,segments).render(source,ready,executable,
+            edits=edits,regions=regions,preview_gain=args.preview_gain_db,
+            blend=args.blend,fuzz=args.fuzz)
+        native_receipt=checked_native()
         native_hash=sha(native)
         native_receipt=dict(native_receipt)
         native_receipt.pop('path',None)
         native_receipt['parameters']=dict(native_receipt['parameters'])
         native_receipt['parameters'].pop('input',None)
-        final,details=Renderer(root,preset,progress).render(source,native,executable,
-            edits=edits,regions=regions,preview_gain=args.preview_gain_db,
-            blend=args.blend,fuzz=args.fuzz)
-        check=sf.info(final);metrics=audio.stats(final)
+        check=sf.info(final);metrics=details.get('metrics') or audio.stats(final)
         if check.samplerate!=48000 or check.channels!=1 or check.subtype!='PCM_24' or metrics['true_peak']>=.99:
             raise ValueError('Output format/peak verification failed')
         if sha(source)!=source_hash or sha(native)!=native_hash or sha(args.preset)!=preset_hash:
@@ -100,11 +159,14 @@ def process(args):
             native_restoration=native_receipt,fresh_runtime_verification=artifacts,
             denoiser_sha256=sha(executable),
             implementation_sha256={str(p.relative_to(ROOT)):sha(p) for p in implementation},
+            quality=dict(settings,window_workers=workers,denoise_segments=segments,
+                silent_windows_planned=None if skipped is None else len(skipped)),
             repair_mode='supplied-local-plan' if regions is not None else 'automatic-current-detector',
             edit_plan_sha256=sha(args.edit_list) if args.edit_list else None,
             repair_plan_sha256=sha(args.repair_regions) if args.repair_regions else None,
             **details)
         meta=root/'receipt.json';meta.write_text(json.dumps(metadata,indent=2)+'\n')
+        sync(final)  # intermediate stems are not synced; the published file is
         try:
             os.link(final,output);os.link(meta,receipt)
         except BaseException:
@@ -122,6 +184,10 @@ def main(argv=None):
     ap.add_argument('--output',type=Path,required=True,help='New 24-bit WAV; JSON receipt saved alongside')
     ap.add_argument('--preset',type=Path,default=ROOT/'presets/studio-v1.json')
     ap.add_argument('--device',choices=['cuda','cpu'],default='cuda')
+    ap.add_argument('--quality',choices=list(tiers.TIERS),default=tiers.DEFAULT,
+        help='Speed/quality tier. '+' '.join(f'{name}: {tier["summary"]}' for name,tier in tiers.TIERS.items()))
+    ap.add_argument('--workers',type=int,help='Processes for independent audio windows (default: CPUs minus one, at most 8)')
+    ap.add_argument('--threads',type=int,help='CPU threads for model inference (default: one per physical core)')
     ap.add_argument('--native-stem',type=Path,help='Reuse a source-hash-verified TF native WAV and its JSON receipt')
     ap.add_argument('--edit-list',type=Path,help='Optional local sample-index keep list; no automatic repeat deletion')
     ap.add_argument('--repair-regions',type=Path,help='Optional local source-sample repair plan for a saved session')
@@ -133,6 +199,8 @@ def main(argv=None):
     for label,value,low,high in [('blend',args.blend,0,1),('fuzz',args.fuzz,0,1),('preview-gain-db',args.preview_gain_db,-36,36)]:
         if value is not None and (not math.isfinite(value) or not low<=value<=high):
             ap.error(f'--{label} must be finite and between {low} and {high}')
+    for label,value in [('workers',args.workers),('threads',args.threads)]:
+        if value is not None and value<1:ap.error(f'--{label} must be at least 1')
     args.output.parent.mkdir(parents=True,exist_ok=True)
     previous={s:signal.signal(s,_interrupt) for s in (signal.SIGTERM,signal.SIGHUP)}
     lock_path=args.output.parent/('.'+args.output.name+'.lock')
