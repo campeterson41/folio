@@ -65,12 +65,16 @@ def process(args):
     audio.validate_edits(edits,info.frames)
     regions=repair_regions(json.loads(args.repair_regions.read_text()),info.frames) if args.repair_regions else None
     # Conservative preflight: bounded RAM, but many file-backed stages.
-    required=info.frames*8*70
+    required=info.frames*8*80
     if shutil.disk_usage(output.parent).free<required:
         raise OSError(f'Studio needs about {required/1024**3:.1f} GiB temporary free space for this take')
     runtime=runtime_root();executable=binary(runtime)
     def progress(phase, seconds):
         if not args.quiet:print(f'{phase}: {seconds:.1f}s',file=sys.stderr,flush=True)
+    from voicelab.studio_mastering import require_meter
+    require_meter()
+    from voicelab.master_me import engine
+    engine()
     preflight_source(source)
     artifacts=None
     with tempfile.TemporaryDirectory(prefix='.folio-studio-',dir=output.parent) as tmp:

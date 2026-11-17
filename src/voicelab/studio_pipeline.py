@@ -36,7 +36,8 @@ class Renderer:
     def source_voice(self,source,speech,edits,preview_gain=None):
         p=self.preset;self.announce('source voice')
         work=self.root/'source';work.mkdir()
-        warm,details=source_pipeline.render(source,work,p['source'],tail_db=0,bass_db=3,progress=self.progress)
+        warm,details=source_pipeline.render(source,work,p['source'],tail_db=0,bass_db=3,progress=self.progress,
+            adaptive_gain=not self.saved_preview_gain)
         pre=self.path('source-preview-gain')
         if preview_gain is None:
             preview_gain=A.preview_gain(source,warm,p['source_preview']['target_dbfs'])
@@ -167,8 +168,11 @@ class Renderer:
         cleaned=self.path('cleaned');E.cleanup(selected,guide,model,cleaned,speech)
         target=20*math.log10(A.stats(dense,speech)['rms'])
         voice,db=self.norm(cleaned,'final-voice',speech,target)
-        final=self.path('studio-final');A.add(voice,bed,final,other_gain=fuzz,subtype='PCM_24')
-        return final,dict(final_voice_gain_db=db,cleanup=info)
+        premaster=self.path('studio-premaster');A.add(voice,bed,premaster,other_gain=fuzz)
+        from .studio_mastering import master
+        final=self.path('studio-final')
+        mastering=master(premaster,final)
+        return final,dict(final_voice_gain_db=db,cleanup=info,mastering=mastering)
 
     def render(self,source,native,binary,edits=None,blend=None,fuzz=None,regions=None,preview_gain=None):
         p=self.preset

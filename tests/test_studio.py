@@ -103,6 +103,8 @@ def prepared_cli(tmp_path,monkeypatch):
         path='private-input-path',parameters=dict(seconds=3,input_rate=48000,input='private-input-path'))))
     monkeypatch.setattr(cli,'binary',lambda runtime:executable)
     monkeypatch.setattr(cli,'preflight_source',lambda source:None)
+    from voicelab import master_me
+    monkeypatch.setattr(master_me,'engine',lambda:None)
     args=SimpleNamespace(input=src,output=tmp_path/'output.wav',native_stem=native,
         preset=ROOT/'presets/studio-v1.json',edit_list=None,repair_regions=None,
         quiet=True,preview_gain_db=None,blend=None,fuzz=None)

@@ -86,14 +86,22 @@ def clean_quieter(x, noise_power):
 def noise_profile(source, features):
     """Median noise power from up to 256 quiet, aperiodic source regions."""
     levels = features['level_dbfs']
-    quiet = (levels < np.percentile(levels, 25)) & (features['periodicity'] < .3)
+    # A frame-by-frame bottom quartile fragments even steady room tone: random
+    # RMS fluctuations cross that cutoff every few frames. Allow 6 dB of floor
+    # variation while retaining at least 20 dB separation from speech. At very
+    # low levels autocorrelation can describe hum or chance noise peaks rather
+    # than voicing; only waive that test with a stricter 35 dB speech margin.
+    speech_level = float(np.percentile(levels, 90))
+    ceiling = min(float(np.percentile(levels, 25))+6, speech_level-20)
+    quiet = (levels < ceiling) & ((features['periodicity'] < .3) |
+                                 (levels < speech_level-35))
     quiet = ndimage.binary_erosion(quiet, structure=np.ones(15))
     indexes = np.flatnonzero(quiet)
     indexes = indexes[(indexes*ANALYSIS_HOP >= FFT*2) &
                       (indexes*ANALYSIS_HOP+FFT*2 < features['samples'])]
     if len(indexes) < 3:
         raise ValueError('No reliable quiet source regions for noise estimation. '
-                         'The quietest quarter of the take needs several unbroken '
+                         'The take needs several unbroken '
                          'pauses of 0.3 s or longer containing only room noise.')
     indexes = indexes[np.linspace(0, len(indexes)-1, min(256, len(indexes))).astype(int)]
     spectra = []
@@ -202,7 +210,7 @@ def _metrics_ok(metrics, samples, phase):
         raise ValueError(f'{phase} would clip ({metrics["peak"]:.3f} peak)')
 
 
-def render(source, workdir, preset, tail_db=6., bass_db=3., progress=None):
+def render(source, workdir, preset, tail_db=6., bass_db=3., progress=None, adaptive_gain=False):
     """Render PCM-24 ``workdir/final.wav``; returns its path and details.
 
     ``workdir`` is an empty private directory owned by the caller, which is
@@ -234,6 +242,11 @@ def render(source, workdir, preset, tail_db=6., bass_db=3., progress=None):
     toned = tmp/'preserved-toned.wav'
     stage(source, toned, preserved_tone, progress, 'preserved branch',
           chunk, context, subtype='DOUBLE')
+
+    if adaptive_gain:
+        from .studio_audio import preview_gain
+        gain_db = preview_gain(source, toned, target=-26.)
+        gain = 10**(gain_db/20)
 
     def preserved_finish(x):
         y, meta = dsp.limit_peaks(x*gain, peak_db=PEAK_DB)
@@ -279,6 +292,7 @@ def render(source, workdir, preset, tail_db=6., bass_db=3., progress=None):
     controlled.unlink()
     return final, {
         'samples': samples, 'metrics': metrics, 'gain_db': gain_db,
+        'gain_method': 'measured-speech' if adaptive_gain else 'preset-fixed',
         'tone': {'frequencies_hz': list(tone['frequencies_hz']),
                  'gains_db': list(tone['gains_db'])},
         'noise_profile': {'source_frames': len(noise_indexes),
