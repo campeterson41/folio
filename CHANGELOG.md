@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Studio uses measured source speech gain before limiting and final EBU R128
+  verification at −26 LUFS mono / −3 dBTP. Add pinned upstream master_me 1.3.1
+  for adaptive speech leveling, compression, multiband dynamics and limiting.
+  Setup builds the unmodified engine and verifies its identity. Requires FFmpeg
+  with LADSPA support. Legacy CPU source mode keeps its preset gain.
+
+- Fix rejection of very quiet microphone room tone: allow bounded noise-floor
+  variation and low-level hum while requiring a 20 dB speech margin (35 dB
+  when relaxing periodicity). Keep the minimum continuous-pause check and
+  rejection of continuous noise without a separate quiet reference.
+
 ## 0.3.0 — Folio Studio
 
 - Make `bin/folio` run the official Studio recipe, also available as

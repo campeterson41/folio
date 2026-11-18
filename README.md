@@ -31,7 +31,7 @@ pauses for source noise estimation. Output is a **24-bit WAV** and a JSON receip
 No words or retakes are removed by default: the sample count stays unchanged.
 Existing files are never overwritten. Audio is processed in bounded windows;
 coarse decision arrays and temporary disk usage grow with the take's duration.
-Allow about 1.5 GiB per input minute in temporary free disk space and substantial
+Allow about 1.8 GiB per input minute in temporary free disk space and substantial
 processing time; the command checks available space before starting. CPU model inference is available with `--device cpu`, but has not been
 benchmarked for chapter-length takes.
 
@@ -60,6 +60,36 @@ The renderer uses TF-Restormer, nara-wpe and the pinned DeepFilterNet executable
 It never reads an Auphonic waveform at runtime. Neural processing may alter fine
 speech detail, and the denoiser has a 16-bit intermediate; a 24-bit final file
 does not imply lossless restoration.
+
+### Automatic speech mastering (local revision)
+
+Studio uses **[master_me 1.3.1](https://github.com/trummerschlunk/master_me)**,
+a free GPL-3.0-or-later mastering engine, after the final voice blend. Its speech
+preset supplies adaptive leveling, soft-knee compression, multiband dynamics,
+and limiting. Folio bounds the leveler to ±6 dB and bypasses the plugin EQ to
+retain the existing Folio tone settings. The noise gate stays bypassed so pauses
+keep their continuous floor.
+
+Before source peak protection, speech gain is measured from the recording
+instead of using the old fixed preset boost. Before master_me, a measured whole
+take gain brings the programme near target, avoiding an excessive opening level.
+After master_me, FFmpeg independently measures EBU R128 loudness and Folio trims
+toward **−26 LUFS mono**, verifying a **−3 dBTP** ceiling. This is a restrained
+local listening target, not a delivery specification. Uniform gain is capped at
++12 dB in addition to the engine's bounded dynamic leveling. Receipts report
+whether the target was reached, levels, final safety limiting, engine version,
+library hash, preset hash and control settings under `mastering`.
+
+FFmpeg must have LADSPA enabled. `tools/setup_studio_runtime.py` now also builds
+the pinned engine using git, make, a C++ compiler and pkg-config (Linux).
+`python3 tools/setup_mastering_runtime.py --verify-only` verifies the installed
+engine; `--offline` performs verification without downloading. Code is built
+unmodified from the pinned upstream release, with source retained in the runtime
+vendor directory for default installs. No accounts or paid services are needed.
+
+Saved `--preview-gain-db` sessions keep their original source gain behavior but
+still receive master_me. Historical reproduction requires the original release.
+This local revision has not been published. Sample count and edits are preserved.
 
 ### Saved sessions and reproduction
 

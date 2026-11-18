@@ -46,6 +46,10 @@ assert actual==expected,(actual,expected)
 print(json.dumps(actual))
 """
     result=subprocess.check_output([str(python),'-c',code],env=dict(os.environ,HF_HUB_OFFLINE='1'),text=True)
+    mastering=[sys.executable,str(ROOT/'tools/setup_mastering_runtime.py')]
+    if args.verify_only:mastering.append('--verify-only')
+    elif args.offline:mastering.append('--offline')
+    subprocess.run(mastering,check=True)
     print('Folio Studio verified: '+result.strip())
 
 

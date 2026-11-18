@@ -1,0 +1,8 @@
+{
+  "engine": "master_me",
+  "version": "1.3.1",
+  "repository": "https://github.com/trummerschlunk/master_me.git",
+  "commit": "fef15e4ad3f70f63196c6690b6b538f743146908",
+  "license": "GPL-3.0-or-later",
+  "plugin": "master_me-ladspa.so"
+}

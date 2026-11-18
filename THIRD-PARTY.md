@@ -49,3 +49,16 @@ a saved numerical FIR filter. It contains no copied room-tone samples. The
 EQ and noise-spectrum settings were developed locally using listening feedback
 and numerical comparisons, including a processed Auphonic reference. Folio
 ships no Auphonic waveform or algorithm and needs no reference file to run.
+
+## master_me automatic speech mastering
+
+The local Studio revision hosts upstream **master_me 1.3.1** through FFmpeg's
+LADSPA filter. master_me is GPL-3.0-or-later, by Klaus Scheuermann and the
+contributors credited in its repository: https://github.com/trummerschlunk/master_me.
+The pinned source commit is `fef15e4ad3f70f63196c6690b6b538f743146908`.
+The upstream DSP is built unmodified; Folio's speech control values derive from
+the upstream SPEECH GENERAL preset. The license is in
+`licenses/master_me-GPL-3.0.txt`, and installed beside the engine. Setup retains
+the source checkout and pinned submodules and records the built library hash.
+No plugin binary is included in this source repository. FFmpeg independently
+measures final EBU R128 loudness and true peak.

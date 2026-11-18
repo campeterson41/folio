@@ -139,6 +139,36 @@ def test_continuous_noise_without_pauses_fails_clearly(tmp_path):
     assert not (tmp_path/'o.wav').exists()
 
 
+def test_very_quiet_room_tone_survives_frame_fluctuations(tmp_path):
+    # Real microphone floors can have periodic hum and random correlation peaks
+    # even 40 dB below speech. Neither is evidence of spoken syllables.
+    from voicelab.adaptive import analyze
+    rng = np.random.default_rng(23)
+    t = np.arange(12*RATE)/RATE
+    x = rng.normal(0, 10**(-84/20), len(t))
+    x += 10**(-85/20)*np.sin(2*np.pi*120*t)
+    speech = (t >= 5) & (t < 9)
+    x[speech] += .02*np.sin(2*np.pi*173*t[speech])
+    src = tmp_path/'quiet-mic.wav'
+    sf.write(src, x, RATE, subtype='PCM_32')
+    features = analyze(src)
+    noise, indexes = p.noise_profile(src, features)
+    assert len(indexes) > 100
+    assert np.isfinite(noise).all()
+    # Every full spectral reference window lies outside the synthetic speech.
+    for i in indexes:
+        assert i*960+2*p.FFT < 5*RATE or i*960-2*p.FFT >= 9*RATE
+
+
+def test_steady_aperiodic_noise_is_not_its_own_quiet_reference(tmp_path):
+    from voicelab.adaptive import analyze
+    rng = np.random.default_rng(24)
+    src = tmp_path/'continuous-noise.wav'
+    sf.write(src, rng.normal(0, .02, 8*RATE), RATE, subtype='PCM_24')
+    with pytest.raises(ValueError, match='quiet'):
+        p.noise_profile(src, analyze(src))
+
+
 def test_interruption_removes_temporary_files(tmp_path, monkeypatch):
     x, _ = narration(15, seed=5, lead=.8)
     f = tmp_path/'take.wav'
@@ -346,3 +376,18 @@ def test_receipt_race_keeps_other_writers_file(tmp_path, rendered, monkeypatch):
     with pytest.raises(FileExistsError):
         folio_source.main(['--input',str(rendered['src']),'--output',str(output),'--quiet'])
     assert not output.exists() and receipt.read_text()=='other writer'
+
+
+def test_adaptive_gain_tracks_input_before_peak_limiting(tmp_path):
+    x, _ = narration(10, speech_peak=.1, noise_dbfs=-74)
+    results=[]
+    for name, scale in [('quiet', .25), ('loud', 4.)]:
+        src=tmp_path/(name+'.wav');sf.write(src,x*scale,RATE,subtype='DOUBLE')
+        work=tmp_path/name;work.mkdir()
+        out, details=p.render(src,work,preset(),tail_db=0,bass_db=3,adaptive_gain=True)
+        assert details['gain_method']=='measured-speech'
+        results.append((sf.read(out)[0],details))
+    # 24 dB input difference is corrected before either source limiter.
+    assert abs(results[0][1]['gain_db']-results[1][1]['gain_db']-24.0824)<.05
+    np.testing.assert_allclose(results[0][0],results[1][0],atol=3e-6)
+    assert max(results[1][1]['limiter_max_reduction_db'].values())<.1
