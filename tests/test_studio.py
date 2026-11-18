@@ -103,8 +103,10 @@ def prepared_cli(tmp_path,monkeypatch):
         path='private-input-path',parameters=dict(seconds=3,input_rate=48000,input='private-input-path'))))
     monkeypatch.setattr(cli,'binary',lambda runtime:executable)
     monkeypatch.setattr(cli,'preflight_source',lambda source:None)
-    from voicelab import master_me
+    from voicelab import master_me, studio_mastering
     monkeypatch.setattr(master_me,'engine',lambda:None)
+    # The fake renderer below does the mastering; only the CLI's FFmpeg preflight needs standing in.
+    monkeypatch.setattr(studio_mastering,'require_meter',lambda:'ffmpeg')
     args=SimpleNamespace(input=src,output=tmp_path/'output.wav',native_stem=native,
         preset=ROOT/'presets/studio-v1.json',edit_list=None,repair_regions=None,
         quiet=True,preview_gain_db=None,blend=None,fuzz=None)
@@ -115,6 +117,16 @@ def prepared_cli(tmp_path,monkeypatch):
             return final,dict(samples=5*48000,reference_audio_read=False)
     monkeypatch.setattr(cli,'Renderer',FakeRenderer)
     return args
+
+
+def test_cli_requires_ffmpeg_before_rendering(tmp_path,monkeypatch):
+    from voicelab import studio_mastering
+    real=studio_mastering.require_meter
+    args=prepared_cli(tmp_path,monkeypatch)
+    monkeypatch.setattr(studio_mastering,'require_meter',real)
+    monkeypatch.setattr(studio_mastering.shutil,'which',lambda name:None)
+    with pytest.raises(ValueError,match='requires FFmpeg'):cli.process(args)
+    assert not args.output.exists()
 
 
 def test_cli_publishes_verified_complete_pair(tmp_path,monkeypatch):
